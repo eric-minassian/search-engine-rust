@@ -7,19 +7,22 @@ use std::{
 
 use crate::indexer::{IndexData, InvertedIndex};
 
+const KEY_DELIMITER: &str = ":";
+const DOCUMENT_DELIMITER: &str = "|";
+const DATA_DELIMITER: &str = ",";
+const TEMP_DB_SUFFIX: &str = ".tmp";
+
 #[derive(Debug)]
 pub struct InvertedIndexDatabase {
     db_path: String,
     doc_index_path: String,
     doc_index: HashMap<String, u64>,
-    database: Option<BufReader<File>>,
+    database: BufReader<File>,
 }
 
 impl InvertedIndexDatabase {
     pub fn new(db_path: String, doc_index_path: String, restart: bool) -> io::Result<Self> {
-        let index;
-
-        if restart {
+        let index = if restart {
             if Path::new(&db_path).exists() {
                 std::fs::remove_file(&db_path)?;
             }
@@ -27,13 +30,14 @@ impl InvertedIndexDatabase {
                 std::fs::remove_file(&doc_index_path)?;
             }
             File::create(&db_path)?;
-            index = HashMap::new();
+
+            HashMap::new()
         } else {
-            index = serde_json::from_str(&fs::read_to_string(&doc_index_path)?)?
-        }
+            serde_json::from_str(&fs::read_to_string(&doc_index_path)?)?
+        };
 
         Ok(InvertedIndexDatabase {
-            database: Some(BufReader::new(File::open(&db_path)?)),
+            database: BufReader::new(File::open(&db_path)?),
             db_path,
             doc_index_path,
             doc_index: index,
@@ -49,125 +53,116 @@ impl InvertedIndexDatabase {
         Ok(())
     }
 
-    pub fn refresh_index(&mut self) -> io::Result<()> {
-        match &mut self.database {
-            None => return Err(io::Error::other("Database not open")),
-            Some(database) => {
-                self.doc_index.clear();
+    fn refresh_index(&mut self) -> io::Result<()> {
+        self.doc_index.clear();
+        self.database.seek(SeekFrom::Start(0))?;
 
-                let mut seek_pos;
-                let mut line = String::new();
+        let mut seek_pos;
+        let mut line = String::new();
 
-                loop {
-                    seek_pos = database.stream_position()?;
-                    database.read_line(&mut line)?;
+        loop {
+            seek_pos = self.database.stream_position()?;
+            self.database.read_line(&mut line)?;
 
-                    if line.is_empty() {
-                        break;
-                    };
+            if line.is_empty() {
+                break;
+            };
 
-                    self.doc_index.insert(
-                        line.split("<>").collect::<Vec<&str>>()[0].to_string(),
-                        seek_pos,
-                    );
+            let key_len = line.split(KEY_DELIMITER).nth(0).unwrap().parse().unwrap();
+            let line_without = line.split(KEY_DELIMITER).nth(1).unwrap();
 
-                    line.clear();
-                }
-            }
+            self.doc_index
+                .insert(line_without[..key_len].to_string(), seek_pos);
+
+            line.clear();
         }
 
         Ok(())
     }
 
-    pub fn set(&mut self, inverted_index: InvertedIndex) -> io::Result<()> {
-        if inverted_index.len() == 0 {
+    pub fn set(&mut self, inverted_index: &InvertedIndex) -> io::Result<()> {
+        if inverted_index.is_empty() {
             return Ok(());
         }
 
-        match &mut self.database {
-            None => return Err(io::Error::other("Database not open")),
-            Some(database) => {
-                let mut temp_database = File::create(Path::new(&format!("{}.tmp", self.db_path)))?;
+        let temp_db_path = format!("{}{}", self.db_path, TEMP_DB_SUFFIX);
+        let temp_db = File::create(Path::new(&temp_db_path))?;
+        let mut writer = BufWriter::new(temp_db);
 
-                let mut value_str: Vec<String>;
+        for (key, value) in inverted_index.iter() {
+            let value_str = value
+                .iter()
+                .map(|x| format!("{}{}{}", x.doc_id, DATA_DELIMITER, x.tf_idf))
+                .collect::<Vec<String>>()
+                .join(DOCUMENT_DELIMITER);
 
-                for (key, value) in inverted_index.iter() {
-                    value_str = value
-                        .iter()
-                        .map(|x| format!("{},{}", x.doc_id, x.tf_idf))
-                        .collect();
+            let new_value = if let Some(&offset) = self.doc_index.get(key) {
+                self.database.seek(SeekFrom::Start(offset))?;
+                let mut old_value = String::new();
+                self.database.read_line(&mut old_value)?;
+                let old_value = old_value.split(KEY_DELIMITER).nth(1).unwrap()[key.len()..].trim();
+                format!("{}{}{}", old_value, DOCUMENT_DELIMITER, value_str)
+            } else {
+                value_str
+            };
 
-                    let new_value;
+            writeln!(writer, "{}{}{}{}", key.len(), KEY_DELIMITER, key, new_value)?;
+        }
 
-                    if self.doc_index.contains_key(key) {
-                        database.seek(SeekFrom::Start(self.doc_index[key]))?;
-                        let mut old_value = String::new();
-                        database.read_line(&mut old_value)?;
-                        old_value = old_value.split("<>").collect::<Vec<&str>>()[1]
-                            .trim()
-                            .to_string();
-
-                        let mut new_value_list: Vec<String> =
-                            old_value.split("|").map(String::from).collect();
-
-                        new_value_list.append(&mut value_str);
-                        new_value = new_value_list.join("|");
-                    } else {
-                        new_value = value_str.join("|");
-                    }
-
-                    temp_database.write(format!("{key}<>{new_value}\n").as_bytes())?;
-                }
-
+        for (key, &offset) in &self.doc_index {
+            if !inverted_index.contains_key(key) {
+                self.database.seek(SeekFrom::Start(offset))?;
                 let mut line = String::new();
-                for (key, value) in &self.doc_index {
-                    if !inverted_index.contains_key(key) {
-                        database.seek(SeekFrom::Start(*value))?;
-                        database.read_line(&mut line)?;
-                        temp_database.write(line.as_bytes())?;
-                    }
-                }
+                self.database.read_line(&mut line)?;
+                write!(writer, "{}", line)?;
             }
         }
 
-        self.database = None;
-        remove_file(&self.db_path)?;
-        rename(format!("{}.tmp", self.db_path), &self.db_path)?;
+        writer.flush()?;
 
-        self.database = Some(BufReader::new(File::open(&self.db_path)?));
+        remove_file(&self.db_path)?;
+        rename(temp_db_path, &self.db_path)?;
+
+        self.database = BufReader::new(File::open(&self.db_path)?);
         self.refresh_index()?;
 
         Ok(())
     }
 
     pub fn get(&mut self, key: &str) -> io::Result<Vec<IndexData>> {
-        match &mut self.database {
-            None => return Err(io::Error::other("Database Not Open")),
-            Some(database) => {
-                if !self.doc_index.contains_key(key) {
-                    return Ok(Vec::new());
-                }
-
-                let seek_pos = self.doc_index.get(key).unwrap();
-                database.seek(SeekFrom::Start(*seek_pos))?;
-
-                let mut data = String::new();
-                database.read_line(&mut data)?;
-                data = data.split("<>").collect::<Vec<&str>>()[1].to_string();
-
-                let data_list: Vec<&str> = data.split("|").collect();
-                let mut res = Vec::new();
-                for data in data_list {
-                    let temp_tuple: Vec<&str> = data.split(",").map(|x| x.trim()).collect();
-                    res.push(IndexData {
-                        doc_id: temp_tuple[0].parse().unwrap(),
-                        tf_idf: temp_tuple[1].parse().unwrap(),
-                    })
-                }
-
-                return Ok(res);
-            }
+        let seek_pos = match self.doc_index.get(key) {
+            Some(pos) => pos,
+            None => return Ok(Vec::new()),
         };
+
+        self.database.seek(SeekFrom::Start(*seek_pos))?;
+
+        let mut data = String::new();
+        self.database.read_line(&mut data)?;
+        let values = &data
+            .split(KEY_DELIMITER)
+            .nth(1)
+            .ok_or_else(|| io::Error::other("Invalid data format"))?[key.len()..];
+
+        values
+            .split(DOCUMENT_DELIMITER)
+            .map(|data| {
+                let mut parts = data.split(DATA_DELIMITER).map(str::trim);
+                let doc_id = parts
+                    .next()
+                    .ok_or_else(|| io::Error::other("Missing doc_id"))?
+                    .parse()
+                    .map_err(|_| io::Error::other("Couldn't parse doc_id"))?;
+
+                let tf_idf = parts
+                    .next()
+                    .ok_or_else(|| io::Error::other("Missing tf_idf"))?
+                    .parse()
+                    .map_err(|_| io::Error::other("Couldn't parse tf_idf"))?;
+
+                Ok(IndexData { doc_id, tf_idf })
+            })
+            .collect()
     }
 }
 
@@ -217,7 +212,7 @@ mod tests {
             ],
         );
 
-        db.set(inverted_index).unwrap();
+        db.set(&inverted_index).unwrap();
 
         assert_eq!(
             db.get("hello").unwrap(),
@@ -271,7 +266,7 @@ mod tests {
             ],
         );
 
-        db.set(inverted_index).unwrap();
+        db.set(&inverted_index).unwrap();
 
         assert_eq!(
             db.get("hello").unwrap(),
