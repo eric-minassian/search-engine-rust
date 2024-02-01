@@ -15,3 +15,7 @@ Cargo.lock
 
 # Data
 data
+
+# Output
+*.json
+*.db

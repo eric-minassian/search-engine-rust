@@ -1,11 +1,13 @@
+mod indexer;
+
 use std::{
     collections::HashMap,
-    fs::{self, remove_file, rename, File},
+    fs::{remove_file, rename, File},
     io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
     path::Path,
 };
 
-use crate::indexer::{IndexData, InvertedIndex};
+use self::indexer::{DocumentIndex, IndexData, InvertedIndex};
 
 const KEY_DELIMITER: &str = ":";
 const DOCUMENT_DELIMITER: &str = "|";
@@ -16,13 +18,23 @@ const TEMP_DB_SUFFIX: &str = ".tmp";
 pub struct InvertedIndexDatabase {
     db_path: String,
     doc_index_path: String,
-    doc_index: HashMap<String, u64>,
+    url_map_path: String,
     database: BufReader<File>,
+    doc_index: HashMap<String, u64>,
+    url_map: HashMap<u64, String>,
 }
 
 impl InvertedIndexDatabase {
-    pub fn new(db_path: String, doc_index_path: String, restart: bool) -> io::Result<Self> {
-        let index = if restart {
+    pub fn new(
+        db_path: String,
+        doc_index_path: String,
+        url_map_path: String,
+        restart: bool,
+    ) -> io::Result<Self> {
+        let doc_index;
+        let url_map;
+
+        if restart {
             if Path::new(&db_path).exists() {
                 std::fs::remove_file(&db_path)?;
             }
@@ -31,23 +43,36 @@ impl InvertedIndexDatabase {
             }
             File::create(&db_path)?;
 
-            HashMap::new()
+            doc_index = HashMap::new();
+            url_map = HashMap::new();
         } else {
-            serde_json::from_str(&fs::read_to_string(&doc_index_path)?)?
+            doc_index = serde_json::from_reader(BufReader::new(File::open(&doc_index_path)?))?;
+            url_map = serde_json::from_reader(BufReader::new(File::open(&url_map_path)?))?;
         };
 
         Ok(InvertedIndexDatabase {
             database: BufReader::new(File::open(&db_path)?),
             db_path,
+            doc_index,
+            url_map_path,
             doc_index_path,
-            doc_index: index,
+            url_map,
         })
+    }
+
+    pub fn initialize(&mut self) {
+        self.create_index("data".to_string());
     }
 
     pub fn close(&self) -> io::Result<()> {
         let file = File::create(&self.doc_index_path)?;
         let mut writer = BufWriter::new(file);
         serde_json::to_writer(&mut writer, &self.doc_index)?;
+        writer.flush()?;
+
+        let file = File::create(&self.url_map_path)?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer(&mut writer, &self.url_map)?;
         writer.flush()?;
 
         Ok(())
@@ -68,8 +93,11 @@ impl InvertedIndexDatabase {
                 break;
             };
 
-            let key_len = line.split(KEY_DELIMITER).nth(0).unwrap().parse().unwrap();
-            let line_without = line.split(KEY_DELIMITER).nth(1).unwrap();
+            // let key_len = line.split(KEY_DELIMITER).nth(0).unwrap().parse().unwrap();
+            // let line_without = line.split(KEY_DELIMITER).nth(1).unwrap();
+            let split_data = line.split_once(KEY_DELIMITER).unwrap();
+            let key_len = split_data.0.parse().unwrap();
+            let line_without = split_data.1;
 
             self.doc_index
                 .insert(line_without[..key_len].to_string(), seek_pos);
@@ -80,7 +108,7 @@ impl InvertedIndexDatabase {
         Ok(())
     }
 
-    pub fn set(&mut self, inverted_index: &InvertedIndex) -> io::Result<()> {
+    fn set(&mut self, inverted_index: &InvertedIndex) -> io::Result<()> {
         if inverted_index.is_empty() {
             return Ok(());
         }
@@ -92,7 +120,7 @@ impl InvertedIndexDatabase {
         for (key, value) in inverted_index.iter() {
             let value_str = value
                 .iter()
-                .map(|x| format!("{}{}{}", x.doc_id, DATA_DELIMITER, x.tf_idf))
+                .map(|x| format!("{}{}{}", x.doc_id, DATA_DELIMITER, x.tf))
                 .collect::<Vec<String>>()
                 .join(DOCUMENT_DELIMITER);
 
@@ -129,7 +157,40 @@ impl InvertedIndexDatabase {
         Ok(())
     }
 
-    pub fn get(&mut self, key: &str) -> io::Result<Vec<IndexData>> {
+    fn get_internal(&mut self, key: &str) -> io::Result<Vec<IndexData>> {
+        let seek_pos = match self.doc_index.get(key) {
+            Some(pos) => pos,
+            None => return Ok(Vec::new()),
+        };
+
+        self.database.seek(SeekFrom::Start(*seek_pos))?;
+
+        let mut data = String::new();
+        self.database.read_line(&mut data)?;
+        let values = &data.split_once(KEY_DELIMITER).unwrap().1[key.len()..];
+
+        values
+            .split(DOCUMENT_DELIMITER)
+            .map(|data| {
+                let mut parts = data.split(DATA_DELIMITER).map(str::trim);
+                let doc_id = parts
+                    .next()
+                    .ok_or_else(|| io::Error::other("Missing doc_id"))?
+                    .parse()
+                    .map_err(|_| io::Error::other("Couldn't parse doc_id"))?;
+
+                let tf_idf = parts
+                    .next()
+                    .ok_or_else(|| io::Error::other("Missing tf_idf"))?
+                    .parse()
+                    .map_err(|_| io::Error::other("Couldn't parse tf_idf"))?;
+
+                Ok(IndexData { doc_id, tf: tf_idf })
+            })
+            .collect()
+    }
+
+    pub fn get(&mut self, key: &str) -> io::Result<Vec<DocumentIndex>> {
         let seek_pos = match self.doc_index.get(key) {
             Some(pos) => pos,
             None => return Ok(Vec::new()),
@@ -160,7 +221,7 @@ impl InvertedIndexDatabase {
                     .parse()
                     .map_err(|_| io::Error::other("Couldn't parse tf_idf"))?;
 
-                Ok(IndexData { doc_id, tf_idf })
+                Ok(DocumentIndex { doc_id, tf_idf })
             })
             .collect()
     }
@@ -172,167 +233,98 @@ mod tests {
 
     #[test]
     fn general_test() {
-        let mut db =
-            InvertedIndexDatabase::new("temp.txt".to_string(), "temp.file".to_string(), true)
-                .unwrap();
+        let mut db = InvertedIndexDatabase::new(
+            "database.db".to_string(),
+            "doc_index.json".to_string(),
+            "url_map.json".to_string(),
+            true,
+        )
+        .unwrap();
 
         assert_eq!(db.get("hello").unwrap(), Vec::new());
+
+        for i in 1..9 {
+            db.url_map.insert(i, format!("https://{}", i));
+        }
 
         let mut inverted_index = HashMap::new();
 
         inverted_index.insert(
             "hello".to_string(),
             vec![
-                IndexData {
-                    doc_id: 1,
-                    tf_idf: 0.4,
-                },
-                IndexData {
-                    doc_id: 2,
-                    tf_idf: 0.3,
-                },
-                IndexData {
-                    doc_id: 4,
-                    tf_idf: 0.23,
-                },
+                IndexData { doc_id: 1, tf: 3 },
+                IndexData { doc_id: 2, tf: 5 },
+                IndexData { doc_id: 3, tf: 4 },
             ],
         );
 
         inverted_index.insert(
             "jeff".to_string(),
             vec![
-                IndexData {
-                    doc_id: 4,
-                    tf_idf: 0.43,
-                },
-                IndexData {
-                    doc_id: 7,
-                    tf_idf: 0.2,
-                },
+                IndexData { doc_id: 4, tf: 2 },
+                IndexData { doc_id: 7, tf: 4 },
             ],
         );
 
         db.set(&inverted_index).unwrap();
-
-        assert_eq!(
-            db.get("hello").unwrap(),
-            vec![
-                IndexData {
-                    doc_id: 1,
-                    tf_idf: 0.4,
-                },
-                IndexData {
-                    doc_id: 2,
-                    tf_idf: 0.3,
-                },
-                IndexData {
-                    doc_id: 4,
-                    tf_idf: 0.23,
-                },
-            ]
-        );
-
-        assert_eq!(
-            db.get("jeff").unwrap(),
-            vec![
-                IndexData {
-                    doc_id: 4,
-                    tf_idf: 0.43,
-                },
-                IndexData {
-                    doc_id: 7,
-                    tf_idf: 0.2,
-                },
-            ],
-        );
 
         let mut inverted_index = HashMap::new();
 
         inverted_index.insert(
             "hello".to_string(),
             vec![
+                IndexData { doc_id: 5, tf: 34 },
+                IndexData { doc_id: 7, tf: 13 },
                 IndexData {
                     doc_id: 8,
-                    tf_idf: 3.4,
-                },
-                IndexData {
-                    doc_id: 9,
-                    tf_idf: 1.3,
-                },
-                IndexData {
-                    doc_id: 42,
-                    tf_idf: 0.22342,
+                    tf: 22_342,
                 },
             ],
         );
 
         db.set(&inverted_index).unwrap();
+        db.calculate_scores().unwrap();
 
-        assert_eq!(
-            db.get("hello").unwrap(),
-            vec![
-                IndexData {
-                    doc_id: 1,
-                    tf_idf: 0.4,
-                },
-                IndexData {
-                    doc_id: 2,
-                    tf_idf: 0.3,
-                },
-                IndexData {
-                    doc_id: 4,
-                    tf_idf: 0.23,
-                },
-                IndexData {
-                    doc_id: 8,
-                    tf_idf: 3.4,
-                },
-                IndexData {
-                    doc_id: 9,
-                    tf_idf: 1.3,
-                },
-                IndexData {
-                    doc_id: 42,
-                    tf_idf: 0.22342,
-                },
-            ]
-        );
+        let expected_output = vec![
+            DocumentIndex {
+                doc_id: 1,
+                tf_idf: 0.1845496633819414,
+            },
+            DocumentIndex {
+                doc_id: 2,
+                tf_idf: 0.21226716587714,
+            },
+            DocumentIndex {
+                doc_id: 3,
+                tf_idf: 0.20015935128721957,
+            },
+            DocumentIndex {
+                doc_id: 5,
+                tf_idf: 0.31627977764580667,
+            },
+            DocumentIndex {
+                doc_id: 7,
+                tf_idf: 0.2641134116987305,
+            },
+            DocumentIndex {
+                doc_id: 8,
+                tf_idf: 0.668312550575298,
+            },
+        ];
+
+        assert_eq!(db.get("hello").unwrap(), expected_output);
 
         db.close().unwrap();
         drop(db);
 
-        let mut db =
-            InvertedIndexDatabase::new("temp.txt".to_string(), "temp.file".to_string(), false)
-                .unwrap();
+        let mut db = InvertedIndexDatabase::new(
+            "database.db".to_string(),
+            "doc_index.json".to_string(),
+            "url_map.json".to_string(),
+            false,
+        )
+        .unwrap();
 
-        assert_eq!(
-            db.get("hello").unwrap(),
-            vec![
-                IndexData {
-                    doc_id: 1,
-                    tf_idf: 0.4,
-                },
-                IndexData {
-                    doc_id: 2,
-                    tf_idf: 0.3,
-                },
-                IndexData {
-                    doc_id: 4,
-                    tf_idf: 0.23,
-                },
-                IndexData {
-                    doc_id: 8,
-                    tf_idf: 3.4,
-                },
-                IndexData {
-                    doc_id: 9,
-                    tf_idf: 1.3,
-                },
-                IndexData {
-                    doc_id: 42,
-                    tf_idf: 0.22342,
-                },
-            ]
-        );
+        assert_eq!(db.get("hello").unwrap(), expected_output);
     }
 }
