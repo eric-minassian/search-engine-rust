@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use rust_stemmers::{Algorithm, Stemmer};
 use tokenizers::Tokenizer;
 
-use crate::inverted_index_db::InvertedIndexDatabase;
+use crate::database::InvertedIndexDatabase;
 
 pub struct SearchResult {
     pub url: String,
@@ -52,7 +52,7 @@ impl SearchEngine {
         document_ids
             .iter()
             .map(|(doc_id, _)| SearchResult {
-                url: self.inverted_index_db.url_map.get(doc_id).unwrap().clone(),
+                url: self.inverted_index_db.get_doc(*doc_id).unwrap().url.clone(),
             })
             .collect()
     }

@@ -1,30 +1,59 @@
+mod doc_map;
 mod indexer;
-mod url_map;
 
 use std::{
     collections::HashMap,
     fs::{remove_file, rename, File},
     io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use self::{
-    indexer::{DocumentIndex, InvertedIndex},
-    url_map::URLMap,
+    doc_map::{Doc, DocMap},
+    indexer::InvertedIndex,
 };
+
+#[derive(Debug, PartialEq)]
+pub struct TermIndex {
+    pub doc_id: u64,
+    pub tf_idf: f64,
+}
+
+impl FromStr for TermIndex {
+    type Err = std::io::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut parts = s.split(DATA_DELIMITER);
+        let doc_id = parts
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Couldn't parse doc_id"))?
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Couldn't parse doc_id"))?;
+        let tf_idf = parts
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Couldn't parse tf_idf"))?
+            .parse()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Couldn't parse tf_idf"))?;
+
+        Ok(Self { doc_id, tf_idf })
+    }
+}
 
 const KEY_DELIMITER: &str = ":";
 const DOCUMENT_DELIMITER: &str = "|";
 const DATA_DELIMITER: &str = ",";
 const TEMP_FILE_SUFFIX: &str = ".tmp";
 
+type SeekPosMap = HashMap<String, u64>;
+
 pub struct InvertedIndexDatabase {
     db_path: PathBuf,
-    doc_index_path: PathBuf,
-    url_map_path: PathBuf,
+    seek_pos_map_path: PathBuf,
+    doc_map_path: PathBuf,
     database: BufReader<File>,
-    doc_index: HashMap<String, u64>,
-    pub url_map: URLMap,
+    seek_pos_map: SeekPosMap,
+    doc_map: DocMap,
 }
 
 impl InvertedIndexDatabase {
@@ -39,10 +68,10 @@ impl InvertedIndexDatabase {
         Ok(Self {
             database: BufReader::new(File::open(&db_path)?),
             db_path,
-            doc_index_path,
-            url_map_path,
-            doc_index,
-            url_map,
+            seek_pos_map_path: doc_index_path,
+            doc_map_path: url_map_path,
+            seek_pos_map: doc_index,
+            doc_map: url_map,
         })
     }
 
@@ -55,10 +84,10 @@ impl InvertedIndexDatabase {
         let mut db = Self {
             database: BufReader::new(File::create(&db_path)?),
             db_path,
-            doc_index_path,
-            url_map_path,
-            doc_index: HashMap::new(),
-            url_map: URLMap::new(),
+            seek_pos_map_path: doc_index_path,
+            doc_map_path: url_map_path,
+            seek_pos_map: HashMap::new(),
+            doc_map: DocMap::new(),
         };
 
         db.create_index(crawled_data_path);
@@ -67,21 +96,21 @@ impl InvertedIndexDatabase {
     }
 
     fn close(&self) -> io::Result<()> {
-        let file = File::create(&self.doc_index_path)?;
+        let file = File::create(&self.seek_pos_map_path)?;
         let mut writer = BufWriter::new(file);
-        serde_json::to_writer(&mut writer, &self.doc_index)?;
+        serde_json::to_writer(&mut writer, &self.seek_pos_map)?;
         writer.flush()?;
 
-        let file = File::create(&self.url_map_path)?;
+        let file = File::create(&self.doc_map_path)?;
         let mut writer = BufWriter::new(file);
-        serde_json::to_writer(&mut writer, &self.url_map)?;
+        serde_json::to_writer(&mut writer, &self.doc_map)?;
         writer.flush()?;
 
         Ok(())
     }
 
     fn refresh_index(&mut self) -> io::Result<()> {
-        self.doc_index.clear();
+        self.seek_pos_map.clear();
         self.database.seek(SeekFrom::Start(0))?;
 
         let mut seek_pos;
@@ -95,13 +124,11 @@ impl InvertedIndexDatabase {
                 break;
             };
 
-            // let key_len = line.split(KEY_DELIMITER).nth(0).unwrap().parse().unwrap();
-            // let line_without = line.split(KEY_DELIMITER).nth(1).unwrap();
             let split_data = line.split_once(KEY_DELIMITER).unwrap();
             let key_len = split_data.0.parse().unwrap();
             let line_without = split_data.1;
 
-            self.doc_index
+            self.seek_pos_map
                 .insert(line_without[..key_len].to_string(), seek_pos);
 
             line.clear();
@@ -126,7 +153,7 @@ impl InvertedIndexDatabase {
                 .collect::<Vec<String>>()
                 .join(DOCUMENT_DELIMITER);
 
-            let new_value = if let Some(&offset) = self.doc_index.get(key) {
+            let new_value = if let Some(&offset) = self.seek_pos_map.get(key) {
                 self.database.seek(SeekFrom::Start(offset))?;
                 let mut old_value = String::new();
                 self.database.read_line(&mut old_value)?;
@@ -139,7 +166,7 @@ impl InvertedIndexDatabase {
             writeln!(writer, "{}{}{}{}", key.len(), KEY_DELIMITER, key, new_value)?;
         }
 
-        for (key, &offset) in &self.doc_index {
+        for (key, &offset) in &self.seek_pos_map {
             if !inverted_index.contains_key(key) {
                 self.database.seek(SeekFrom::Start(offset))?;
                 let mut line = String::new();
@@ -159,8 +186,8 @@ impl InvertedIndexDatabase {
         Ok(())
     }
 
-    pub fn get(&mut self, key: &str) -> io::Result<Vec<DocumentIndex>> {
-        let seek_pos = match self.doc_index.get(key) {
+    pub fn get(&mut self, key: &str) -> io::Result<Vec<TermIndex>> {
+        let seek_pos = match self.seek_pos_map.get(key) {
             Some(pos) => pos,
             None => return Ok(Vec::new()),
         };
@@ -169,58 +196,53 @@ impl InvertedIndexDatabase {
 
         let mut data = String::new();
         self.database.read_line(&mut data)?;
-        let values = &data.split_once(KEY_DELIMITER).unwrap().1[key.len()..];
+        let values = match data.split_once(KEY_DELIMITER) {
+            Some((_, value)) => &value[key.len()..],
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "KEY_DELIMITER not found",
+                ))
+            }
+        }
+        .trim();
 
         values
             .split(DOCUMENT_DELIMITER)
-            .map(|data| {
-                let mut parts = data.split(DATA_DELIMITER).map(str::trim);
-                let doc_id = parts
-                    .next()
-                    .ok_or_else(|| io::Error::other("Missing doc_id"))?
-                    .parse()
-                    .map_err(|_| io::Error::other("Couldn't parse doc_id"))?;
-
-                let tf_idf = parts
-                    .next()
-                    .ok_or_else(|| io::Error::other("Missing tf_idf"))?
-                    .parse()
-                    .map_err(|_| io::Error::other("Couldn't parse tf_idf"))?;
-
-                Ok(DocumentIndex { doc_id, tf_idf })
-            })
+            .map(|data| data.parse())
             .collect()
+    }
+
+    pub fn get_doc(&self, doc_id: u64) -> Option<&Doc> {
+        self.doc_map.get(&doc_id)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use tests::indexer::IndexData;
+    use tests::{doc_map::Doc, indexer::TempTermIndex};
 
     use super::*;
 
     #[test]
     fn general_test() {
-        let db_path = PathBuf::from("temp/test_db.db");
-        let doc_index_path = PathBuf::from("temp/test_doc_index.json");
-        let url_map_path = PathBuf::from("temp/test_url_map.json");
-
-        // Create temp directory
-        std::fs::create_dir_all("temp").unwrap();
+        let db_path = PathBuf::from("tests/test_db.db");
+        let doc_index_path = PathBuf::from("tests/test_doc_index.json");
+        let url_map_path = PathBuf::from("tests/test_url_map.json");
 
         let mut db = InvertedIndexDatabase {
             database: BufReader::new(File::create(&db_path).unwrap()),
             db_path: db_path.clone(),
-            doc_index_path: doc_index_path.clone(),
-            url_map_path: url_map_path.clone(),
-            doc_index: HashMap::new(),
-            url_map: HashMap::new(),
+            seek_pos_map_path: doc_index_path.clone(),
+            doc_map_path: url_map_path.clone(),
+            seek_pos_map: HashMap::new(),
+            doc_map: HashMap::new(),
         };
 
         assert_eq!(db.get("hello").unwrap(), Vec::new());
 
         for i in 1..9 {
-            db.url_map.insert(i, format!("https://{}", i));
+            db.doc_map.insert(i, Doc::new(format!("https://{}", i)));
         }
 
         let mut inverted_index = HashMap::new();
@@ -228,17 +250,17 @@ mod tests {
         inverted_index.insert(
             "hello".to_string(),
             vec![
-                IndexData { doc_id: 1, tf: 3 },
-                IndexData { doc_id: 2, tf: 5 },
-                IndexData { doc_id: 3, tf: 4 },
+                TempTermIndex { doc_id: 1, tf: 3 },
+                TempTermIndex { doc_id: 2, tf: 5 },
+                TempTermIndex { doc_id: 3, tf: 4 },
             ],
         );
 
         inverted_index.insert(
             "jeff".to_string(),
             vec![
-                IndexData { doc_id: 4, tf: 2 },
-                IndexData { doc_id: 7, tf: 4 },
+                TempTermIndex { doc_id: 4, tf: 2 },
+                TempTermIndex { doc_id: 7, tf: 4 },
             ],
         );
 
@@ -249,9 +271,9 @@ mod tests {
         inverted_index.insert(
             "hello".to_string(),
             vec![
-                IndexData { doc_id: 5, tf: 34 },
-                IndexData { doc_id: 7, tf: 13 },
-                IndexData {
+                TempTermIndex { doc_id: 5, tf: 34 },
+                TempTermIndex { doc_id: 7, tf: 13 },
+                TempTermIndex {
                     doc_id: 8,
                     tf: 22_342,
                 },
@@ -262,27 +284,27 @@ mod tests {
         db.calculate_scores().unwrap();
 
         let expected_output = vec![
-            DocumentIndex {
+            TermIndex {
                 doc_id: 1,
                 tf_idf: 0.1845496633819414,
             },
-            DocumentIndex {
+            TermIndex {
                 doc_id: 2,
                 tf_idf: 0.21226716587714,
             },
-            DocumentIndex {
+            TermIndex {
                 doc_id: 3,
                 tf_idf: 0.20015935128721957,
             },
-            DocumentIndex {
+            TermIndex {
                 doc_id: 5,
                 tf_idf: 0.31627977764580667,
             },
-            DocumentIndex {
+            TermIndex {
                 doc_id: 7,
                 tf_idf: 0.2641134116987305,
             },
-            DocumentIndex {
+            TermIndex {
                 doc_id: 8,
                 tf_idf: 0.668312550575298,
             },

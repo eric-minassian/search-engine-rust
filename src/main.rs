@@ -1,7 +1,7 @@
 use std::{io, path::PathBuf};
 
 use clap::Parser;
-use search_engine::{inverted_index_db::InvertedIndexDatabase, search_engine::SearchEngine};
+use search_engine::{database::InvertedIndexDatabase, search_engine::SearchEngine};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
