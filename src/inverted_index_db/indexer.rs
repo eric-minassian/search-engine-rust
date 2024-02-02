@@ -4,15 +4,15 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs::{remove_file, rename, File},
-    io::{self, BufReader, BufWriter, Write},
-    path::Path,
+    io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
 };
-use tokenizers::tokenizer::{Result, Tokenizer};
+use tokenizers::tokenizer::Tokenizer;
 use walkdir::WalkDir;
 
 use crate::inverted_index_db::DATA_DELIMITER;
 
-use super::{InvertedIndexDatabase, DOCUMENT_DELIMITER, KEY_DELIMITER, TEMP_DB_SUFFIX};
+use super::{InvertedIndexDatabase, DOCUMENT_DELIMITER, KEY_DELIMITER, TEMP_FILE_SUFFIX};
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct IndexData {
@@ -40,7 +40,40 @@ const HEADER_WEIGHT: f64 = 5.0;
 const TITLE_WEIGHT: f64 = 10.0;
 
 impl InvertedIndexDatabase {
-    pub fn create_index(&mut self, data_path: String) {
+    fn get_internal(&mut self, key: &str) -> io::Result<Vec<IndexData>> {
+        let seek_pos = match self.doc_index.get(key) {
+            Some(pos) => pos,
+            None => return Ok(Vec::new()),
+        };
+
+        self.database.seek(SeekFrom::Start(*seek_pos))?;
+
+        let mut data = String::new();
+        self.database.read_line(&mut data)?;
+        let values = &data.split_once(KEY_DELIMITER).unwrap().1[key.len()..];
+
+        values
+            .split(DOCUMENT_DELIMITER)
+            .map(|data| {
+                let mut parts = data.split(DATA_DELIMITER).map(str::trim);
+                let doc_id = parts
+                    .next()
+                    .ok_or_else(|| io::Error::other("Missing doc_id"))?
+                    .parse()
+                    .map_err(|_| io::Error::other("Couldn't parse doc_id"))?;
+
+                let tf_idf = parts
+                    .next()
+                    .ok_or_else(|| io::Error::other("Missing tf_idf"))?
+                    .parse()
+                    .map_err(|_| io::Error::other("Couldn't parse tf_idf"))?;
+
+                Ok(IndexData { doc_id, tf: tf_idf })
+            })
+            .collect()
+    }
+
+    pub fn create_index(&mut self, data_path: PathBuf) {
         let stemmer = Stemmer::create(Algorithm::English);
         let tokenizer = Tokenizer::from_pretrained("bert-base-cased", None).unwrap();
 
@@ -158,7 +191,7 @@ impl InvertedIndexDatabase {
     }
 
     pub fn calculate_scores(&mut self) -> io::Result<()> {
-        let temp_db_path = format!("{}{}", self.db_path, TEMP_DB_SUFFIX);
+        let temp_db_path = format!("{}{}", self.db_path.display(), TEMP_FILE_SUFFIX);
         let temp_db = File::create(Path::new(&temp_db_path))?;
         let mut writer = BufWriter::new(temp_db);
 
@@ -190,6 +223,8 @@ impl InvertedIndexDatabase {
 
         self.database = BufReader::new(File::open(&self.db_path)?);
         self.refresh_index()?;
+
+        self.close()?;
 
         Ok(())
     }

@@ -1,70 +1,72 @@
 mod indexer;
+mod url_map;
 
 use std::{
     collections::HashMap,
     fs::{remove_file, rename, File},
     io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
-use self::indexer::{DocumentIndex, IndexData, InvertedIndex};
+use self::{
+    indexer::{DocumentIndex, InvertedIndex},
+    url_map::URLMap,
+};
 
 const KEY_DELIMITER: &str = ":";
 const DOCUMENT_DELIMITER: &str = "|";
 const DATA_DELIMITER: &str = ",";
-const TEMP_DB_SUFFIX: &str = ".tmp";
+const TEMP_FILE_SUFFIX: &str = ".tmp";
 
-#[derive(Debug)]
 pub struct InvertedIndexDatabase {
-    db_path: String,
-    doc_index_path: String,
-    url_map_path: String,
+    db_path: PathBuf,
+    doc_index_path: PathBuf,
+    url_map_path: PathBuf,
     database: BufReader<File>,
     doc_index: HashMap<String, u64>,
-    url_map: HashMap<u64, String>,
+    pub url_map: URLMap,
 }
 
 impl InvertedIndexDatabase {
-    pub fn new(
-        db_path: String,
-        doc_index_path: String,
-        url_map_path: String,
-        restart: bool,
+    pub fn from_cache(
+        db_path: PathBuf,
+        doc_index_path: PathBuf,
+        url_map_path: PathBuf,
     ) -> io::Result<Self> {
-        let doc_index;
-        let url_map;
+        let doc_index = serde_json::from_reader(BufReader::new(File::open(&doc_index_path)?))?;
+        let url_map = serde_json::from_reader(BufReader::new(File::open(&url_map_path)?))?;
 
-        if restart {
-            if Path::new(&db_path).exists() {
-                std::fs::remove_file(&db_path)?;
-            }
-            if Path::new(&doc_index_path).exists() {
-                std::fs::remove_file(&doc_index_path)?;
-            }
-            File::create(&db_path)?;
-
-            doc_index = HashMap::new();
-            url_map = HashMap::new();
-        } else {
-            doc_index = serde_json::from_reader(BufReader::new(File::open(&doc_index_path)?))?;
-            url_map = serde_json::from_reader(BufReader::new(File::open(&url_map_path)?))?;
-        };
-
-        Ok(InvertedIndexDatabase {
+        Ok(Self {
             database: BufReader::new(File::open(&db_path)?),
             db_path,
-            doc_index,
-            url_map_path,
             doc_index_path,
+            url_map_path,
+            doc_index,
             url_map,
         })
     }
 
-    pub fn initialize(&mut self) {
-        self.create_index("data".to_string());
+    pub fn from_crawled_data(
+        crawled_data_path: PathBuf,
+        db_path: PathBuf,
+        doc_index_path: PathBuf,
+        url_map_path: PathBuf,
+    ) -> io::Result<Self> {
+        let mut db = Self {
+            database: BufReader::new(File::create(&db_path)?),
+            db_path,
+            doc_index_path,
+            url_map_path,
+            doc_index: HashMap::new(),
+            url_map: URLMap::new(),
+        };
+
+        db.create_index(crawled_data_path);
+
+        Ok(db)
     }
 
-    pub fn close(&self) -> io::Result<()> {
+    fn close(&self) -> io::Result<()> {
         let file = File::create(&self.doc_index_path)?;
         let mut writer = BufWriter::new(file);
         serde_json::to_writer(&mut writer, &self.doc_index)?;
@@ -113,7 +115,7 @@ impl InvertedIndexDatabase {
             return Ok(());
         }
 
-        let temp_db_path = format!("{}{}", self.db_path, TEMP_DB_SUFFIX);
+        let temp_db_path = format!("{}{}", self.db_path.display(), TEMP_FILE_SUFFIX);
         let temp_db = File::create(Path::new(&temp_db_path))?;
         let mut writer = BufWriter::new(temp_db);
 
@@ -157,7 +159,7 @@ impl InvertedIndexDatabase {
         Ok(())
     }
 
-    fn get_internal(&mut self, key: &str) -> io::Result<Vec<IndexData>> {
+    pub fn get(&mut self, key: &str) -> io::Result<Vec<DocumentIndex>> {
         let seek_pos = match self.doc_index.get(key) {
             Some(pos) => pos,
             None => return Ok(Vec::new()),
@@ -185,42 +187,6 @@ impl InvertedIndexDatabase {
                     .parse()
                     .map_err(|_| io::Error::other("Couldn't parse tf_idf"))?;
 
-                Ok(IndexData { doc_id, tf: tf_idf })
-            })
-            .collect()
-    }
-
-    pub fn get(&mut self, key: &str) -> io::Result<Vec<DocumentIndex>> {
-        let seek_pos = match self.doc_index.get(key) {
-            Some(pos) => pos,
-            None => return Ok(Vec::new()),
-        };
-
-        self.database.seek(SeekFrom::Start(*seek_pos))?;
-
-        let mut data = String::new();
-        self.database.read_line(&mut data)?;
-        let values = &data
-            .split(KEY_DELIMITER)
-            .nth(1)
-            .ok_or_else(|| io::Error::other("Invalid data format"))?[key.len()..];
-
-        values
-            .split(DOCUMENT_DELIMITER)
-            .map(|data| {
-                let mut parts = data.split(DATA_DELIMITER).map(str::trim);
-                let doc_id = parts
-                    .next()
-                    .ok_or_else(|| io::Error::other("Missing doc_id"))?
-                    .parse()
-                    .map_err(|_| io::Error::other("Couldn't parse doc_id"))?;
-
-                let tf_idf = parts
-                    .next()
-                    .ok_or_else(|| io::Error::other("Missing tf_idf"))?
-                    .parse()
-                    .map_err(|_| io::Error::other("Couldn't parse tf_idf"))?;
-
                 Ok(DocumentIndex { doc_id, tf_idf })
             })
             .collect()
@@ -229,17 +195,27 @@ impl InvertedIndexDatabase {
 
 #[cfg(test)]
 mod tests {
+    use tests::indexer::IndexData;
+
     use super::*;
 
     #[test]
     fn general_test() {
-        let mut db = InvertedIndexDatabase::new(
-            "database.db".to_string(),
-            "doc_index.json".to_string(),
-            "url_map.json".to_string(),
-            true,
-        )
-        .unwrap();
+        let db_path = PathBuf::from("temp/test_db.db");
+        let doc_index_path = PathBuf::from("temp/test_doc_index.json");
+        let url_map_path = PathBuf::from("temp/test_url_map.json");
+
+        // Create temp directory
+        std::fs::create_dir_all("temp").unwrap();
+
+        let mut db = InvertedIndexDatabase {
+            database: BufReader::new(File::create(&db_path).unwrap()),
+            db_path: db_path.clone(),
+            doc_index_path: doc_index_path.clone(),
+            url_map_path: url_map_path.clone(),
+            doc_index: HashMap::new(),
+            url_map: HashMap::new(),
+        };
 
         assert_eq!(db.get("hello").unwrap(), Vec::new());
 
@@ -317,13 +293,8 @@ mod tests {
         db.close().unwrap();
         drop(db);
 
-        let mut db = InvertedIndexDatabase::new(
-            "database.db".to_string(),
-            "doc_index.json".to_string(),
-            "url_map.json".to_string(),
-            false,
-        )
-        .unwrap();
+        let mut db =
+            InvertedIndexDatabase::from_cache(db_path, doc_index_path, url_map_path).unwrap();
 
         assert_eq!(db.get("hello").unwrap(), expected_output);
     }
