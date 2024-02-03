@@ -1,7 +1,12 @@
-use std::{io, path::PathBuf};
+use std::{collections::HashMap, io, path::PathBuf};
 
 use clap::Parser;
-use search_engine::{database::InvertedIndexDatabase, search_engine::SearchEngine};
+use search_engine::{
+    database::DiskHashMap,
+    inverted_index::{DiskInvertedIndex, TermIndex},
+    search_engine::SearchEngine,
+};
+use serde::{Deserialize, Serialize};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -27,24 +32,25 @@ struct Args {
     url_map_path: PathBuf,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct Data {
+    hello: i32,
+    list: Vec<i32>,
+}
+
 fn main() {
     let args = Args::parse();
 
     let db = if args.restart {
-        InvertedIndexDatabase::from_crawled_data(
-            args.crawled_data_path,
-            args.db_path,
-            args.doc_index_path,
-            args.url_map_path,
-        )
-        .unwrap()
+        DiskInvertedIndex::new(args.db_path, args.url_map_path, args.crawled_data_path).unwrap()
     } else {
-        InvertedIndexDatabase::from_cache(args.db_path, args.doc_index_path, args.url_map_path)
-            .unwrap()
+        DiskInvertedIndex::from_path(args.db_path, args.url_map_path).unwrap()
     };
 
     let mut search = SearchEngine::new(db);
     let mut buffer = String::new();
+
+    println!("Enter Search Query:");
 
     loop {
         io::stdin().read_line(&mut buffer).unwrap();

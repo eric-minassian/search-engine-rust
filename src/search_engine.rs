@@ -3,20 +3,20 @@ use std::collections::HashMap;
 use rust_stemmers::{Algorithm, Stemmer};
 use tokenizers::Tokenizer;
 
-use crate::database::InvertedIndexDatabase;
+use crate::inverted_index::DiskInvertedIndex;
 
 pub struct SearchResult {
     pub url: String,
 }
 
 pub struct SearchEngine {
-    inverted_index_db: InvertedIndexDatabase,
+    inverted_index_db: DiskInvertedIndex,
     stemmer: Stemmer,
     tokenizer: Tokenizer,
 }
 
 impl SearchEngine {
-    pub fn new(inverted_index_db: InvertedIndexDatabase) -> Self {
+    pub fn new(inverted_index_db: DiskInvertedIndex) -> Self {
         let stemmer = Stemmer::create(Algorithm::English);
         let tokenizer = Tokenizer::from_pretrained("bert-base-cased", None).unwrap();
 
@@ -39,7 +39,7 @@ impl SearchEngine {
 
         for token in stemmed_tokens {
             if let Ok(document_indexes) = self.inverted_index_db.get(&token) {
-                document_indexes.iter().for_each(|document_index| {
+                document_indexes.unwrap().iter().for_each(|document_index| {
                     *document_ids.entry(document_index.doc_id).or_insert(0.0) +=
                         document_index.tf_idf;
                 });
@@ -52,7 +52,13 @@ impl SearchEngine {
         document_ids
             .iter()
             .map(|(doc_id, _)| SearchResult {
-                url: self.inverted_index_db.get_doc(*doc_id).unwrap().url.clone(),
+                url: self
+                    .inverted_index_db
+                    .get_doc(*doc_id)
+                    .unwrap()
+                    .unwrap()
+                    .url
+                    .clone(),
             })
             .collect()
     }
