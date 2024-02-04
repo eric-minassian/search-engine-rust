@@ -6,10 +6,12 @@ use std::{
     fmt::Display,
     fs::{remove_file, rename, File},
     hash::Hash,
-    io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
     marker::PhantomData,
     path::PathBuf,
 };
+
+use crate::error::{Error, Result};
 
 use super::{
     constants::{KEY_DELIMITER, TEMP_FILE_SUFFIX},
@@ -17,7 +19,7 @@ use super::{
 };
 
 #[derive(Debug)]
-pub struct DiskHashMap<K, V>
+pub struct KVDatabase<K, V>
 where
     K: Serialize + for<'de> Deserialize<'de> + Eq + Hash + Display + Clone,
     V: Serialize + for<'de> Deserialize<'de> + Clone,
@@ -29,7 +31,7 @@ where
     _marker: PhantomData<V>,
 }
 
-impl<K, V> Iterator for DiskHashMap<K, V>
+impl<K, V> Iterator for KVDatabase<K, V>
 where
     K: Serialize + for<'de> Deserialize<'de> + Eq + Hash + Display + Clone + From<String>,
     V: Serialize + for<'de> Deserialize<'de> + Clone,
@@ -52,9 +54,11 @@ where
 
         let (key, value) = match buffer.split_once(KEY_DELIMITER) {
             Some((key_len, rest)) => {
-                let key_len = key_len.parse::<u64>().expect("Failed to parse key length");
-                let key = &rest[..key_len as usize];
-                let value = &rest[key_len as usize..];
+                let key_len = key_len
+                    .parse::<usize>()
+                    .expect("Failed to parse key length");
+                let key = K::from(rest[..key_len].to_string());
+                let value = &rest[key_len..];
 
                 (key, value)
             }
@@ -69,22 +73,23 @@ where
             .expect("Failed to get stream position");
 
         Some((
-            key.to_string().into(),
+            key,
             serde_json::from_str(value).expect("Failed to deserialize value"),
         ))
     }
 }
 
-impl<K, V> DiskHashMap<K, V>
+impl<K, V> KVDatabase<K, V>
 where
     K: Serialize + for<'de> Deserialize<'de> + Eq + Hash + Display + Clone,
     V: Serialize + for<'de> Deserialize<'de> + Clone,
 {
-    pub fn new(db_path: PathBuf) -> io::Result<Self> {
+    pub fn new(db_path: PathBuf) -> Result<Self> {
         let db_file = File::create(&db_path)?;
         let mut writer = BufWriter::new(db_file);
         let empty_map: HashMap<K, V> = HashMap::new();
-        serde_json::to_writer(&mut writer, &empty_map)?;
+        serde_json::to_writer(&mut writer, &empty_map)
+            .map_err(|e| Error::Generic(e.to_string()))?;
 
         Ok(Self {
             seek_pos_map: SeekPosMap {
@@ -98,11 +103,12 @@ where
         })
     }
 
-    pub fn from_path(db_path: PathBuf) -> io::Result<Self> {
+    pub fn from_path(db_path: PathBuf) -> Result<Self> {
         let mut database = RevBufReader::new(File::open(&db_path)?);
         let mut buffer = String::new();
         database.read_line(&mut buffer)?;
-        let seek_pos_map: SeekPosMap<K> = serde_json::from_str(&buffer)?;
+        let seek_pos_map: SeekPosMap<K> =
+            serde_json::from_str(&buffer).map_err(|e| Error::Generic(e.to_string()))?;
 
         Ok(Self {
             database: BufReader::new(File::open(&db_path)?),
@@ -113,7 +119,7 @@ where
         })
     }
 
-    pub fn get(&mut self, key: &K) -> io::Result<Option<V>> {
+    pub fn get(&mut self, key: &K) -> Result<Option<V>> {
         if let Some(seek_pos) = self.seek_pos_map.map.get(key) {
             let key_len = key.to_string().len();
 
@@ -124,21 +130,20 @@ where
             let value_str = match data.split_once(KEY_DELIMITER) {
                 Some((_, value)) => &value[key_len..],
                 None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "KEY_DELIMITER not found",
-                    ))
+                    return Err(Error::Generic("KEY_DELIMITER not found".to_string()));
                 }
             }
             .trim();
 
-            Ok(Some(serde_json::from_str(value_str)?))
+            Ok(Some(
+                serde_json::from_str(value_str).map_err(|e| Error::Generic(e.to_string()))?,
+            ))
         } else {
             Ok(None)
         }
     }
 
-    pub fn insert(&mut self, hashmap: HashMap<K, V>) -> io::Result<()> {
+    pub fn insert(&mut self, hashmap: HashMap<K, V>) -> Result<()> {
         if hashmap.is_empty() {
             return Ok(());
         }
@@ -159,14 +164,14 @@ where
                 new_seek_pos_map
                     .map
                     .insert(key.clone(), temp_db_writer.stream_position()?);
-                write!(temp_db_writer, "{}", line)?;
+                write!(temp_db_writer, "{line}")?;
             }
         }
 
-        for (key, value) in hashmap.into_iter() {
+        for (key, value) in hashmap {
             let key_len = key.to_string().len();
 
-            let new_value_str = to_string(&value)?;
+            let new_value_str = to_string(&value).map_err(|e| Error::Generic(e.to_string()))?;
 
             let stream_pos = temp_db_writer.stream_position()?;
 
@@ -181,7 +186,8 @@ where
 
         // Write the new seek_pos_map to the end of the file
         new_seek_pos_map.pos = temp_db_writer.stream_position()?;
-        serde_json::to_writer(&mut temp_db_writer, &new_seek_pos_map)?;
+        serde_json::to_writer(&mut temp_db_writer, &new_seek_pos_map)
+            .map_err(|e| Error::Generic(e.to_string()))?;
 
         temp_db_writer.flush()?;
 
@@ -195,12 +201,12 @@ where
     }
 }
 
-impl<K, V, T> DiskHashMap<K, V>
+impl<K, V, T> KVDatabase<K, V>
 where
     K: Serialize + for<'de> Deserialize<'de> + Eq + Hash + Display + Clone,
     V: Serialize + Extend<T> + for<'de> Deserialize<'de> + IntoIterator<Item = T> + Clone,
 {
-    pub fn extend(&mut self, hashmap: HashMap<K, V>) -> io::Result<()> {
+    pub fn extend(&mut self, hashmap: HashMap<K, V>) -> Result<()> {
         if hashmap.is_empty() {
             return Ok(());
         }
@@ -222,11 +228,11 @@ where
                 new_seek_pos_map
                     .map
                     .insert(key.clone(), temp_db_writer.stream_position()?);
-                write!(temp_db_writer, "{}", line)?;
+                write!(temp_db_writer, "{line}")?;
             }
         }
 
-        for (key, value) in hashmap.into_iter() {
+        for (key, value) in hashmap {
             let key_len = key.to_string().len();
 
             let new_value = if let Some(&offset) = self.seek_pos_map.map.get(&key) {
@@ -234,8 +240,13 @@ where
                 let mut old_value_str = String::new();
                 self.database.read_line(&mut old_value_str)?;
                 let mut old_value = serde_json::from_str::<V>(
-                    &old_value_str.split_once(KEY_DELIMITER).unwrap().1[key_len..].trim(),
-                )?;
+                    old_value_str
+                        .split_once(KEY_DELIMITER)
+                        .ok_or_else(|| Error::Generic("KEY_DELIMITER not found".to_string()))?
+                        .1[key_len..]
+                        .trim(),
+                )
+                .map_err(|e| Error::Generic(e.to_string()))?;
                 old_value.extend(value);
 
                 old_value
@@ -243,7 +254,7 @@ where
                 value
             };
 
-            let new_value_str = to_string(&new_value)?;
+            let new_value_str = to_string(&new_value).map_err(|e| Error::Generic(e.to_string()))?;
 
             let stream_pos = temp_db_writer.stream_position()?;
 
@@ -258,7 +269,8 @@ where
 
         // Write the new seek_pos_map to the end of the file
         new_seek_pos_map.pos = temp_db_writer.stream_position()?;
-        serde_json::to_writer(&mut temp_db_writer, &new_seek_pos_map)?;
+        serde_json::to_writer(&mut temp_db_writer, &new_seek_pos_map)
+            .map_err(|e| Error::Generic(e.to_string()))?;
 
         temp_db_writer.flush()?;
 
@@ -274,7 +286,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use tests::DiskHashMap;
+    use tests::KVDatabase;
 
     use super::*;
 
@@ -282,7 +294,7 @@ mod tests {
     fn basic_str() {
         let db_path = PathBuf::from("tests/basic_str.db");
 
-        let mut db = DiskHashMap::new(db_path.clone()).expect("Failed to create DiskHashMap");
+        let mut db = KVDatabase::new(db_path.clone()).expect("Failed to create DiskHashMap");
 
         let mut hashmap = HashMap::new();
         hashmap.insert("hello".to_string(), vec![1, 2, 3]);
@@ -300,7 +312,7 @@ mod tests {
     fn basic_int() {
         let db_path = PathBuf::from("tests/basic_int.db");
 
-        let mut db = DiskHashMap::new(db_path.clone()).expect("Failed to create DiskHashMap");
+        let mut db = KVDatabase::new(db_path.clone()).expect("Failed to create DiskHashMap");
 
         let mut hashmap = HashMap::new();
         hashmap.insert(1, vec![1, 2, 3]);
@@ -318,7 +330,7 @@ mod tests {
     fn extend_map() {
         let db_path = PathBuf::from("tests/extend_map.db");
 
-        let mut db = DiskHashMap::new(db_path.clone()).expect("Failed to create DiskHashMap");
+        let mut db = KVDatabase::new(db_path.clone()).expect("Failed to create DiskHashMap");
 
         let mut hashmap = HashMap::new();
         hashmap.insert("hello".to_string(), vec![1, 2, 3]);
@@ -348,7 +360,7 @@ mod tests {
     fn restore_from_path() {
         let db_path = PathBuf::from("tests/restore_from_path.db");
 
-        let mut db = DiskHashMap::new(db_path.clone()).expect("Failed to create DiskHashMap");
+        let mut db = KVDatabase::new(db_path.clone()).expect("Failed to create DiskHashMap");
 
         let mut hashmap = HashMap::new();
         hashmap.insert("hello".to_string(), vec![1, 2, 3]);
@@ -357,7 +369,7 @@ mod tests {
         db.extend(hashmap.clone())
             .expect("Failed to insert hashmap");
 
-        let mut db2 = DiskHashMap::from_path(db_path.clone())
+        let mut db2 = KVDatabase::from_path(db_path.clone())
             .expect("Failed to restore DiskHashMap from path");
 
         assert_eq!(
@@ -374,7 +386,7 @@ mod tests {
     fn extend() {
         let db_path = PathBuf::from("tests/extend.db");
 
-        let mut db = DiskHashMap::new(db_path.clone()).expect("Failed to create DiskHashMap");
+        let mut db = KVDatabase::new(db_path.clone()).expect("Failed to create DiskHashMap");
 
         let mut hashmap = HashMap::new();
         hashmap.insert("hello".to_string(), vec![1, 2, 3]);
@@ -407,7 +419,7 @@ mod tests {
     fn iterator() {
         let db_path = PathBuf::from("tests/iterator.db");
 
-        let mut db = DiskHashMap::new(db_path.clone()).expect("Failed to create DiskHashMap");
+        let mut db = KVDatabase::new(db_path.clone()).expect("Failed to create DiskHashMap");
 
         let mut hashmap = HashMap::new();
         hashmap.insert("hello".to_string(), vec![1, 2, 3]);
@@ -441,7 +453,7 @@ mod tests {
     fn insert() {
         let db_path = PathBuf::from("tests/insert.db");
 
-        let mut db = DiskHashMap::new(db_path.clone()).expect("Failed to create DiskHashMap");
+        let mut db = KVDatabase::new(db_path.clone()).expect("Failed to create DiskHashMap");
 
         let mut hashmap = HashMap::new();
         hashmap.insert("hello".to_string(), vec![1, 2, 3]);

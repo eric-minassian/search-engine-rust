@@ -1,8 +1,11 @@
-use crate::database::{constants::TEMP_FILE_SUFFIX, disk_hash_map::DiskHashMap};
+use crate::{
+    error::{Error, Result},
+    kv_database::{constants::TEMP_FILE_SUFFIX, disk_hash_map::KVDatabase},
+};
 
 use super::{
     constants::{BOLD_WEIGHT, HEADER_WEIGHT, TITLE_WEIGHT},
-    doc_map::{Doc, DocMap},
+    doc_map::{Doc, DocID, DocMap, TF, TFIDF},
 };
 use rust_stemmers::{Algorithm, Stemmer};
 use scraper::{Html, Selector};
@@ -10,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs::{rename, File},
-    io::{self, BufReader},
+    io::BufReader,
     path::PathBuf,
 };
 use tokenizers::Tokenizer;
@@ -25,21 +28,21 @@ struct CrawlFile {
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct TermIndex {
-    pub doc_id: u64,
-    pub tf_idf: f64,
+    pub doc_id: DocID,
+    pub tf_idf: TFIDF,
 }
 
-#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct TempTermIndex {
-    pub doc_id: u64,
-    pub tf: u64,
+    pub doc_id: DocID,
+    pub tf: TF,
 }
 
 pub type InvertedIndex = HashMap<String, Vec<TempTermIndex>>;
 
 pub struct DiskInvertedIndex {
-    pub db: DiskHashMap<String, Vec<TermIndex>>,
-    pub url_map: DiskHashMap<u64, Doc>,
+    pub db: KVDatabase<String, Vec<TermIndex>>,
+    pub url_map: KVDatabase<DocID, Doc>,
 }
 
 impl DiskInvertedIndex {
@@ -47,53 +50,56 @@ impl DiskInvertedIndex {
         db_path: PathBuf,
         url_map_path: PathBuf,
         crawled_data_path: PathBuf,
-    ) -> io::Result<Self> {
+    ) -> Result<Self> {
         create_index(db_path.clone(), url_map_path.clone(), crawled_data_path)?;
 
-        let db = DiskHashMap::from_path(db_path)?;
-        let url_map = DiskHashMap::from_path(url_map_path)?;
+        let db = KVDatabase::from_path(db_path)?;
+        let url_map = KVDatabase::from_path(url_map_path)?;
 
         Ok(Self { db, url_map })
     }
 
-    pub fn from_path(db_path: PathBuf, url_map_path: PathBuf) -> io::Result<Self> {
-        let db = DiskHashMap::from_path(db_path)?;
-        let url_map = DiskHashMap::from_path(url_map_path)?;
+    pub fn from_path(db_path: PathBuf, url_map_path: PathBuf) -> Result<Self> {
+        let db = KVDatabase::from_path(db_path)?;
+        let url_map = KVDatabase::from_path(url_map_path)?;
 
         Ok(Self { db, url_map })
     }
 
-    pub fn get(&mut self, key: &str) -> io::Result<Option<Vec<TermIndex>>> {
+    pub fn get(&mut self, key: &str) -> Result<Option<Vec<TermIndex>>> {
         self.db.get(&key.to_string())
     }
 
-    pub fn get_doc(&mut self, key: u64) -> io::Result<Option<Doc>> {
-        self.url_map.get(&key)
+    pub fn get_doc(&mut self, doc_id: DocID) -> Result<Option<Doc>> {
+        self.url_map.get(&doc_id)
     }
 }
 
-fn create_index(db_path: PathBuf, url_map_path: PathBuf, data_path: PathBuf) -> io::Result<()> {
+#[allow(clippy::too_many_lines)]
+fn create_index(db_path: PathBuf, url_map_path: PathBuf, data_path: PathBuf) -> Result<()> {
     let stemmer = Stemmer::create(Algorithm::English);
-    let tokenizer = Tokenizer::from_pretrained("bert-base-cased", None).unwrap();
+    let tokenizer = Tokenizer::from_pretrained("bert-base-cased", None)
+        .map_err(|e| Error::Generic(format!("Failed to load tokenizer: {e}")))?;
 
-    let mut db = DiskHashMap::new(db_path.clone())?;
-    let mut url_map = DiskHashMap::new(url_map_path)?;
+    let mut db = KVDatabase::new(db_path.clone())?;
+    let mut url_map = KVDatabase::new(url_map_path)?;
 
     let mut inverted_index = InvertedIndex::new();
     let mut doc_map = DocMap::new();
 
     let mut num_docs = 0;
 
-    for (doc_id, entry) in WalkDir::new(&data_path)
+    for (doc_id, entry) in WalkDir::new(data_path)
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|e| e.file_type().is_file())
         .enumerate()
     {
-        let data: CrawlFile =
-            serde_json::from_reader(BufReader::new(File::open(entry.path()).unwrap())).unwrap();
+        let data: CrawlFile = serde_json::from_reader(BufReader::new(File::open(entry.path())?))
+            .map_err(|e| Error::Generic(format!("Failed to parse crawl file: {e}")))?;
 
         let document = Html::parse_document(&data.content);
+        let doc_id = doc_id as DocID;
 
         // Extract and filter all text
         let all_text = document.root_element().text().collect::<Vec<_>>().join(" ");
@@ -102,7 +108,7 @@ fn create_index(db_path: PathBuf, url_map_path: PathBuf, data_path: PathBuf) -> 
 
         tokenizer
             .encode(all_text, false)
-            .unwrap()
+            .map_err(|e| Error::Generic(format!("Failed to tokenize text: {e}")))?
             .get_tokens()
             .iter()
             .for_each(|token| {
@@ -111,19 +117,28 @@ fn create_index(db_path: PathBuf, url_map_path: PathBuf, data_path: PathBuf) -> 
             });
 
         let bolded_words = document
-            .select(&Selector::parse("b, strong").unwrap())
+            .select(
+                &Selector::parse("b, strong")
+                    .map_err(|e| Error::Generic(format!("Failed to parse selector: {e}")))?,
+            )
             .map(|element| element.text().collect::<Vec<_>>().join(" "))
             .collect::<Vec<_>>()
             .join(" ");
 
         let title_words = document
-            .select(&Selector::parse("title").unwrap())
+            .select(
+                &Selector::parse("title")
+                    .map_err(|e| Error::Generic(format!("Failed to parse selector: {e}")))?,
+            )
             .map(|element| element.text().collect::<Vec<_>>().join(" "))
             .collect::<Vec<_>>()
             .join(" ");
 
         let header_words = document
-            .select(&Selector::parse("h1, h2, h3, h4, h5").unwrap())
+            .select(
+                &Selector::parse("h1, h2, h3, h4, h5")
+                    .map_err(|e| Error::Generic(format!("Failed to parse selector: {e}")))?,
+            )
             .map(|element| element.text().collect::<Vec<_>>().join(" "))
             .collect::<Vec<_>>()
             .join(" ");
@@ -151,35 +166,29 @@ fn create_index(db_path: PathBuf, url_map_path: PathBuf, data_path: PathBuf) -> 
 
         for word in bolded_words {
             let count = word_count.entry(word).or_insert(0);
-            *count += (BOLD_WEIGHT - 1.0) as u32;
+            *count += (BOLD_WEIGHT - 1.0) as TF;
         }
 
         for word in title_words {
             let count = word_count.entry(word).or_insert(0);
-            *count += (TITLE_WEIGHT - 1.0) as u32;
+            *count += (TITLE_WEIGHT - 1.0) as TF;
         }
 
         for word in header_words {
             let count = word_count.entry(word).or_insert(0);
-            *count += (HEADER_WEIGHT - 1.0) as u32;
+            *count += (HEADER_WEIGHT - 1.0) as TF;
         }
 
         for (word, count) in word_count {
-            let index_data = TempTermIndex {
-                doc_id: doc_id as u64,
-                tf: count as u64,
-            };
+            let index_data = TempTermIndex { doc_id, tf: count };
 
-            inverted_index
-                .entry(word)
-                .or_insert_with(Vec::new)
-                .push(index_data);
+            inverted_index.entry(word).or_default().push(index_data);
         }
 
-        doc_map.insert(doc_id as u64, Doc::new(data.url));
+        doc_map.insert(doc_id, Doc::new(data.url));
 
         if doc_id % 1_000 == 0 {
-            println!("Processed {} documents", doc_id);
+            println!("Processed {doc_id} documents");
         }
 
         if doc_id % 10_000 == 0 {
@@ -202,13 +211,13 @@ fn create_index(db_path: PathBuf, url_map_path: PathBuf, data_path: PathBuf) -> 
 }
 
 pub fn calculate_scores(
-    db: DiskHashMap<String, Vec<TempTermIndex>>,
+    db: KVDatabase<String, Vec<TempTermIndex>>,
     db_path: PathBuf,
     num_docs: u64,
-) -> io::Result<()> {
+) -> Result<()> {
     let temp_db_path = format!("{}{}", db_path.display(), TEMP_FILE_SUFFIX);
 
-    let mut temp_db = DiskHashMap::new(temp_db_path.clone().into())?;
+    let mut temp_db = KVDatabase::new(temp_db_path.clone().into())?;
 
     let mut final_map: HashMap<String, Vec<TermIndex>> = HashMap::new();
 
@@ -231,7 +240,7 @@ pub fn calculate_scores(
         final_map.insert(key, new_data);
 
         if i % 1_000 == 0 {
-            println!("Translate {} documents", i);
+            println!("Translate {i} documents");
         }
 
         if i % 10_000 == 0 {
@@ -242,7 +251,7 @@ pub fn calculate_scores(
 
     temp_db.extend(final_map)?;
 
-    std::fs::rename(temp_db_path, db_path)?;
+    rename(temp_db_path, db_path)?;
 
     Ok(())
 }

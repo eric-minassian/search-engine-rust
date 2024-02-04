@@ -2,17 +2,19 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct Doc {
     pub url: String,
 }
 
 impl Doc {
-    pub fn new(url: String) -> Self {
-        Doc { url }
+    pub const fn new(url: String) -> Self {
+        Self { url }
     }
 }
 
-type DocID = u64;
+pub type DocID = u64;
+pub type TF = u32;
+pub type TFIDF = f64;
 
 pub type DocMap = HashMap<DocID, Doc>;
