@@ -1,50 +1,37 @@
-use std::{collections::HashMap, io, path::PathBuf};
+use std::{io, path::PathBuf};
 
-use clap::Parser;
+use clap::{Parser, ValueHint};
 use search_engine::{
-    database::DiskHashMap,
-    inverted_index::{DiskInvertedIndex, TermIndex},
-    search_engine::SearchEngine,
+    inverted_index::disk_inverted_index::DiskInvertedIndex, search_engine::SearchEngine,
 };
-use serde::{Deserialize, Serialize};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
     /// Restarts the database
-    #[arg(short, long, default_value = "false")]
+    #[arg(short, long, default_value_t = false, requires = "crawled_data_path")]
     restart: bool,
 
     /// Path to the crawled data
-    #[arg(long, default_value = "data")]
-    crawled_data_path: PathBuf,
+    #[arg(short, long, value_hint = ValueHint::FilePath)]
+    crawled_data: Option<PathBuf>,
 
     /// Path to the database
-    #[arg(long, default_value = "database.db")]
-    db_path: PathBuf,
-
-    /// Path to the document index
-    #[arg(long, default_value = "doc_index.json")]
-    doc_index_path: PathBuf,
+    #[arg(short, long, value_hint = ValueHint::FilePath)]
+    db: PathBuf,
 
     /// Path to the URL map
-    #[arg(long, default_value = "url_map.json")]
-    url_map_path: PathBuf,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct Data {
-    hello: i32,
-    list: Vec<i32>,
+    #[arg(short, long, value_hint = ValueHint::FilePath)]
+    url_map: PathBuf,
 }
 
 fn main() {
     let args = Args::parse();
 
     let db = if args.restart {
-        DiskInvertedIndex::new(args.db_path, args.url_map_path, args.crawled_data_path).unwrap()
+        DiskInvertedIndex::new(args.db, args.url_map, args.crawled_data.unwrap()).unwrap()
     } else {
-        DiskInvertedIndex::from_path(args.db_path, args.url_map_path).unwrap()
+        DiskInvertedIndex::from_path(args.db, args.url_map).unwrap()
     };
 
     let mut search = SearchEngine::new(db);

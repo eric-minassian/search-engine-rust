@@ -1,9 +1,8 @@
-use std::collections::HashMap;
-
 use rust_stemmers::{Algorithm, Stemmer};
+use std::collections::HashMap;
 use tokenizers::Tokenizer;
 
-use crate::inverted_index::DiskInvertedIndex;
+use crate::inverted_index::disk_inverted_index::DiskInvertedIndex;
 
 pub struct SearchResult {
     pub url: String,
