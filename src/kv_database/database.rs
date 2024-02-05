@@ -11,7 +11,7 @@ use std::{
     path::PathBuf,
 };
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 use super::seek_pos_map::SeekPos;
 use super::{constants::TEMP_FILE_SUFFIX, seek_pos_map::SeekPosMap};
@@ -29,70 +29,15 @@ where
     _marker: PhantomData<V>,
 }
 
-// impl<K, V> IntoIterator for KVDatabase<K, V>
-// where
-//     K: Serialize + for<'de> Deserialize<'de> + Eq + Hash + Display + Clone + From<String>,
-//     V: Serialize + for<'de> Deserialize<'de> + Clone,
-// {
-// type Item = (K, V);
-// type Item = (K, V);
-// type IntoIter = KVDatabaseIterator<K, V>;
-
-// fn next(&mut self) -> Option<Self::Item> {
-//     let (key, seek_pos) = self.seek_pos_map.next()?;
-
-// if self.iter_seek_pos >= self.seek_pos_map.pos {
-//     return None;
-// }
-
-// self.database
-//     .seek(SeekFrom::Start(self.iter_seek_pos))
-//     .expect("Failed to seek to next position");
-
-// let mut buffer = String::new();
-// self.database
-//     .read_line(&mut buffer)
-//     .expect("Failed to read line from database");
-
-// let (key, value) = match buffer.split_once(KEY_DELIMITER) {
-//     Some((key_len, rest)) => {
-//         let key_len = key_len
-//             .parse::<usize>()
-//             .expect("Failed to parse key length");
-//         let key = K::from(rest[..key_len].to_string());
-//         let value = &rest[key_len..];
-
-//         (key, value)
-//     }
-//     None => {
-//         panic!("KEY_DELIMITER not found");
-//     }
-// };
-
-// self.iter_seek_pos = self
-//     .database
-//     .stream_position()
-//     .expect("Failed to get stream position");
-
-// Some((
-//     key,
-//     serde_json::from_str(value).expect("Failed to deserialize value"),
-// ))
-// }
-// }
-
 impl<K, V> KVDatabase<K, V>
 where
     K: Serialize + for<'de> Deserialize<'de> + Eq + Hash + Display + Clone,
     V: Serialize + for<'de> Deserialize<'de> + Clone,
 {
-    pub fn new(db_path: PathBuf) -> Result<Self> {
-        let seek_path = db_path.with_extension("seek");
-
+    pub fn new(db_path: PathBuf, seek_path: PathBuf) -> Result<Self> {
         let seek_pos_map: SeekPosMap<K> = SeekPosMap::new();
 
-        let serialized =
-            bincode::serialize(&seek_pos_map).map_err(|e| Error::Generic(e.to_string()))?;
+        let serialized = bincode::serialize(&seek_pos_map)?;
         let mut file = File::create(&seek_path)?;
         file.write_all(&serialized)?;
 
@@ -105,14 +50,11 @@ where
         })
     }
 
-    pub fn from(db_path: PathBuf) -> Result<Self> {
-        let seek_path = db_path.with_extension("seek");
-
+    pub fn from(db_path: PathBuf, seek_path: PathBuf) -> Result<Self> {
         let mut file = File::open(&seek_path)?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
-        let seek_pos_map: SeekPosMap<K> =
-            bincode::deserialize(&buffer).map_err(|e| Error::Generic(e.to_string()))?;
+        let seek_pos_map: SeekPosMap<K> = bincode::deserialize(&buffer)?;
 
         Ok(Self {
             database: BufReader::new(File::open(&db_path)?),
@@ -127,11 +69,10 @@ where
         if let Some(seek_pos) = self.seek_pos_map.get(key) {
             self.database.seek(SeekFrom::Start(seek_pos.pos))?;
 
-            // Read seek_pos.len bytes
             let mut buffer = vec![0; seek_pos.len as usize];
             self.database.read_exact(&mut buffer)?;
-            let value: V =
-                bincode::deserialize(&buffer).map_err(|e| Error::Generic(e.to_string()))?;
+
+            let value: V = bincode::deserialize(&buffer)?;
 
             Ok(Some(value))
         } else {
@@ -149,6 +90,7 @@ where
 
         let mut new_seek_pos_map: HashMap<K, SeekPos> = SeekPosMap::new();
 
+        // Copy the old values to the new file
         for (key, seek_pos) in &self.seek_pos_map {
             if !hashmap.contains_key(&key) {
                 self.database.seek(SeekFrom::Start(seek_pos.pos))?;
@@ -163,8 +105,9 @@ where
             }
         }
 
+        // Insert the new values
         for (key, value) in hashmap {
-            let value = bincode::serialize(&value).map_err(|e| Error::Generic(e.to_string()))?;
+            let value = bincode::serialize(&value)?;
             new_seek_pos_map.insert(
                 key,
                 SeekPos::new(temp_db_writer.stream_position()?, value.len() as u64),
@@ -176,11 +119,11 @@ where
         temp_db_writer.flush()?;
 
         // Write the new seek_pos_map to the self.seek_path
-        let serialized =
-            bincode::serialize(&new_seek_pos_map).map_err(|e| Error::Generic(e.to_string()))?;
+        let serialized = bincode::serialize(&new_seek_pos_map)?;
         let mut file = File::create(&self.seek_path)?;
         file.write_all(&serialized)?;
 
+        // Remove the old db file and rename the temp_db file
         remove_file(&self.db_path)?;
         rename(temp_db_path, &self.db_path)?;
 
@@ -206,6 +149,7 @@ where
 
         let mut new_seek_pos_map: HashMap<K, SeekPos> = SeekPosMap::new();
 
+        // Copy the old values to the new file
         for (key, seek_pos) in &self.seek_pos_map {
             if !hashmap.contains_key(&key) {
                 self.database.seek(SeekFrom::Start(seek_pos.pos))?;
@@ -220,13 +164,13 @@ where
             }
         }
 
+        // Insert the new values
         for (key, value) in hashmap {
             let new_value = if let Some(seek_pos) = self.seek_pos_map.get(&key) {
                 self.database.seek(SeekFrom::Start(seek_pos.pos))?;
                 let mut buffer = vec![0; seek_pos.len as usize];
                 self.database.read_exact(&mut buffer)?;
-                let mut old_value: V =
-                    bincode::deserialize(&buffer).map_err(|e| Error::Generic(e.to_string()))?;
+                let mut old_value: V = bincode::deserialize(&buffer)?;
                 old_value.extend(value);
 
                 old_value
@@ -234,8 +178,7 @@ where
                 value
             };
 
-            let value =
-                bincode::serialize(&new_value).map_err(|e| Error::Generic(e.to_string()))?;
+            let value = bincode::serialize(&new_value)?;
             new_seek_pos_map.insert(
                 key,
                 SeekPos::new(temp_db_writer.stream_position()?, value.len() as u64),
@@ -247,8 +190,7 @@ where
         temp_db_writer.flush()?;
 
         // Write the new seek_pos_map to the self.seek_path
-        let serialized =
-            bincode::serialize(&new_seek_pos_map).map_err(|e| Error::Generic(e.to_string()))?;
+        let serialized = bincode::serialize(&new_seek_pos_map)?;
         let mut file = File::create(&self.seek_path)?;
         file.write_all(&serialized)?;
 
@@ -272,7 +214,8 @@ mod tests {
     fn basic_str() {
         let db_path = PathBuf::from("tests/basic_str.db");
 
-        let mut db = KVDatabase::new(db_path.clone()).expect("Failed to create DiskHashMap");
+        let mut db = KVDatabase::new(db_path.clone(), db_path.with_extension("seek"))
+            .expect("Failed to create DiskHashMap");
 
         let mut hashmap = HashMap::new();
         hashmap.insert("hello".to_string(), vec![1, 2, 3]);
@@ -290,7 +233,8 @@ mod tests {
     fn basic_int() {
         let db_path = PathBuf::from("tests/basic_int.db");
 
-        let mut db = KVDatabase::new(db_path.clone()).expect("Failed to create DiskHashMap");
+        let mut db = KVDatabase::new(db_path.clone(), db_path.with_extension("seek"))
+            .expect("Failed to create DiskHashMap");
 
         let mut hashmap = HashMap::new();
         hashmap.insert(1, vec![1, 2, 3]);
@@ -305,40 +249,11 @@ mod tests {
     }
 
     #[test]
-    fn extend_map() {
-        let db_path = PathBuf::from("tests/extend_map.db");
-
-        let mut db = KVDatabase::new(db_path.clone()).expect("Failed to create DiskHashMap");
-
-        let mut hashmap = HashMap::new();
-        hashmap.insert("hello".to_string(), vec![1, 2, 3]);
-        hashmap.insert("world".to_string(), vec![4, 5, 6]);
-
-        db.extend(hashmap.clone())
-            .expect("Failed to insert hashmap");
-
-        let mut hashmap2 = HashMap::new();
-        hashmap2.insert("hello".to_string(), vec![7, 8, 9]);
-        hashmap2.insert("world".to_string(), vec![10, 11, 12]);
-
-        db.extend(hashmap2.clone())
-            .expect("Failed to insert hashmap");
-
-        assert_eq!(
-            db.get(&"hello".to_string()).expect("Failed to get value"),
-            Some(vec![1, 2, 3, 7, 8, 9])
-        );
-        assert_eq!(
-            db.get(&"world".to_string()).expect("Failed to get value"),
-            Some(vec![4, 5, 6, 10, 11, 12])
-        );
-    }
-
-    #[test]
     fn restore_from_path() {
         let db_path = PathBuf::from("tests/restore_from_path.db");
 
-        let mut db = KVDatabase::new(db_path.clone()).expect("Failed to create DiskHashMap");
+        let mut db = KVDatabase::new(db_path.clone(), db_path.with_extension("seek"))
+            .expect("Failed to create DiskHashMap");
 
         let mut hashmap = HashMap::new();
         hashmap.insert("hello".to_string(), vec![1, 2, 3]);
@@ -347,8 +262,8 @@ mod tests {
         db.extend(hashmap.clone())
             .expect("Failed to insert hashmap");
 
-        let mut db2 =
-            KVDatabase::from(db_path.clone()).expect("Failed to restore DiskHashMap from path");
+        let mut db2 = KVDatabase::from(db_path.clone(), db_path.with_extension("seek"))
+            .expect("Failed to restore DiskHashMap from path");
 
         assert_eq!(
             db2.get(&"hello".to_string()).expect("Failed to get value"),
@@ -364,7 +279,8 @@ mod tests {
     fn extend() {
         let db_path = PathBuf::from("tests/extend.db");
 
-        let mut db = KVDatabase::new(db_path.clone()).expect("Failed to create DiskHashMap");
+        let mut db = KVDatabase::new(db_path.clone(), db_path.with_extension("seek"))
+            .expect("Failed to create DiskHashMap");
 
         let mut hashmap = HashMap::new();
         hashmap.insert("hello".to_string(), vec![1, 2, 3]);
@@ -397,7 +313,8 @@ mod tests {
     fn iterator() {
         let db_path = PathBuf::from("tests/iterator.db");
 
-        let mut db = KVDatabase::new(db_path.clone()).expect("Failed to create DiskHashMap");
+        let mut db = KVDatabase::new(db_path.clone(), db_path.with_extension("seek"))
+            .expect("Failed to create DiskHashMap");
 
         let mut hashmap = HashMap::new();
         hashmap.insert("hello".to_string(), vec![1, 2, 3]);
@@ -437,7 +354,8 @@ mod tests {
     fn insert() {
         let db_path = PathBuf::from("tests/insert.db");
 
-        let mut db = KVDatabase::new(db_path.clone()).expect("Failed to create DiskHashMap");
+        let mut db = KVDatabase::new(db_path.clone(), db_path.with_extension("seek"))
+            .expect("Failed to create DiskHashMap");
 
         let mut hashmap = HashMap::new();
         hashmap.insert("hello".to_string(), vec![1, 2, 3]);
@@ -484,7 +402,8 @@ mod tests {
 
         let db_path = PathBuf::from("tests/insert_struct.db");
 
-        let mut db = KVDatabase::new(db_path.clone()).expect("Failed to create DiskHashMap");
+        let mut db = KVDatabase::new(db_path.clone(), db_path.with_extension("seek"))
+            .expect("Failed to create DiskHashMap");
 
         let mut hashmap = HashMap::new();
         hashmap.insert("hello".to_string(), TestStruct { a: 1, b: vec![] });

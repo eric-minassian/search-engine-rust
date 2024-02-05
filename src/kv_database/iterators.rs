@@ -6,18 +6,18 @@ use std::hash::Hash;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::marker::PhantomData;
 
-use super::disk_hash_map::KVDatabase;
+use super::database::KVDatabase;
 use super::seek_pos_map::SeekPos;
 
 use crate::error::{Error, Result};
 
-pub struct KVDbIterator<'a, K, V> {
+pub struct KVDatabaseIterator<'a, K, V> {
     seek_pos_iter: HashMapIter<'a, K, SeekPos>,
     database: &'a mut BufReader<File>,
-    _marker: PhantomData<*const V>, // Use PhantomData to mark V's usage without ownership
+    _marker: PhantomData<*const V>,
 }
 
-impl<'a, K, V> Iterator for KVDbIterator<'a, K, V>
+impl<'a, K, V> Iterator for KVDatabaseIterator<'a, K, V>
 where
     K: Serialize + for<'de> Deserialize<'de> + Eq + Hash + Display + Clone,
     V: Serialize + for<'de> Deserialize<'de> + Clone,
@@ -49,10 +49,10 @@ where
     V: Serialize + for<'de> Deserialize<'de> + Clone,
 {
     type Item = Result<(K, V)>;
-    type IntoIter = KVDbIterator<'a, K, V>;
+    type IntoIter = KVDatabaseIterator<'a, K, V>;
 
     fn into_iter(self) -> Self::IntoIter {
-        KVDbIterator {
+        KVDatabaseIterator {
             seek_pos_iter: self.seek_pos_map.iter(),
             database: &mut self.database,
             _marker: PhantomData,

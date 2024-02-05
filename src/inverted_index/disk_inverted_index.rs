@@ -1,10 +1,10 @@
 use super::{
-    constants::{BOLD_WEIGHT, HEADER_WEIGHT, MAX_ITERATIONS, TITLE_WEIGHT},
+    constants::{BOLD_WEIGHT, HEADER_WEIGHT, MAX_ITERATIONS, TEMP_FILE_SUFFIX, TITLE_WEIGHT},
     doc_map::{Doc, DocID, DocMap, TF, TFIDF},
 };
 use crate::{
     error::{Error, Result},
-    kv_database::{constants::TEMP_FILE_SUFFIX, disk_hash_map::KVDatabase},
+    kv_database::database::KVDatabase,
     tokenizer::Tokenizer,
 };
 use scraper::{Html, Selector};
@@ -36,7 +36,8 @@ pub struct TempTermIndex {
     pub tf: TF,
 }
 
-pub type InvertedIndex = HashMap<String, Vec<TempTermIndex>>;
+pub type TempInvertedIndex = HashMap<String, Vec<TempTermIndex>>;
+pub type InvertedIndex = HashMap<String, Vec<TermIndex>>;
 
 pub struct DiskInvertedIndex {
     pub db: KVDatabase<String, Vec<TermIndex>>,
@@ -46,20 +47,33 @@ pub struct DiskInvertedIndex {
 impl DiskInvertedIndex {
     pub fn new(
         db_path: PathBuf,
+        seek_path: PathBuf,
         url_map_path: PathBuf,
+        url_map_seek_path: PathBuf,
         crawled_data_path: PathBuf,
     ) -> Result<Self> {
-        create_index(db_path.clone(), url_map_path.clone(), crawled_data_path)?;
+        create_index(
+            db_path.clone(),
+            seek_path.clone(),
+            url_map_path.clone(),
+            url_map_seek_path.clone(),
+            crawled_data_path,
+        )?;
 
-        let db = KVDatabase::from(db_path)?;
-        let url_map = KVDatabase::from(url_map_path)?;
+        let db = KVDatabase::from(db_path, seek_path)?;
+        let url_map = KVDatabase::from(url_map_path, url_map_seek_path)?;
 
         Ok(Self { db, url_map })
     }
 
-    pub fn from_path(db_path: PathBuf, url_map_path: PathBuf) -> Result<Self> {
-        let db = KVDatabase::from(db_path)?;
-        let url_map = KVDatabase::from(url_map_path)?;
+    pub fn from(
+        db_path: PathBuf,
+        seek_path: PathBuf,
+        url_map_path: PathBuf,
+        url_map_seek_path: PathBuf,
+    ) -> Result<Self> {
+        let db = KVDatabase::from(db_path, seek_path)?;
+        let url_map = KVDatabase::from(url_map_path, url_map_seek_path)?;
 
         Ok(Self { db, url_map })
     }
@@ -74,13 +88,19 @@ impl DiskInvertedIndex {
 }
 
 #[allow(clippy::too_many_lines)]
-fn create_index(db_path: PathBuf, url_map_path: PathBuf, data_path: PathBuf) -> Result<()> {
+fn create_index(
+    db_path: PathBuf,
+    seek_path: PathBuf,
+    url_map_path: PathBuf,
+    url_map_seek_path: PathBuf,
+    data_path: PathBuf,
+) -> Result<()> {
     let tokenizer = Tokenizer::new()?;
 
-    let mut db = KVDatabase::new(db_path.clone())?;
-    let mut url_map = KVDatabase::new(url_map_path)?;
+    let mut db = KVDatabase::new(db_path.clone(), seek_path.clone())?;
+    let mut url_map = KVDatabase::new(url_map_path, url_map_seek_path)?;
 
-    let mut inverted_index = InvertedIndex::new();
+    let mut inverted_index = TempInvertedIndex::new();
     let mut doc_map = DocMap::new();
 
     let mut num_docs = 0;
@@ -91,8 +111,7 @@ fn create_index(db_path: PathBuf, url_map_path: PathBuf, data_path: PathBuf) -> 
         .filter(|e| e.file_type().is_file())
         .enumerate()
     {
-        let data: CrawlFile = serde_json::from_reader(BufReader::new(File::open(entry.path())?))
-            .map_err(|e| Error::Generic(format!("Failed to parse crawl file: {e}")))?;
+        let data: CrawlFile = serde_json::from_reader(BufReader::new(File::open(entry.path())?))?;
 
         let document = Html::parse_document(&data.content);
         let doc_id = doc_id as DocID;
@@ -133,16 +152,14 @@ fn create_index(db_path: PathBuf, url_map_path: PathBuf, data_path: PathBuf) -> 
 
         doc_map.insert(doc_id, Doc::new(data.url));
 
-        if doc_id % 1_000 == 0 {
-            println!("Processed {doc_id} documents");
-        }
-
         if doc_id % MAX_ITERATIONS == 0 {
             db.extend(inverted_index)?;
             url_map.insert(doc_map)?;
 
-            inverted_index = InvertedIndex::new();
+            inverted_index = TempInvertedIndex::new();
             doc_map = DocMap::new();
+
+            println!("Processed {doc_id} documents");
         }
 
         num_docs += 1;
@@ -151,7 +168,7 @@ fn create_index(db_path: PathBuf, url_map_path: PathBuf, data_path: PathBuf) -> 
     db.extend(inverted_index)?;
     url_map.insert(doc_map)?;
 
-    calculate_scores(db, db_path, num_docs)?;
+    calculate_scores(db, db_path, seek_path, num_docs)?;
 
     Ok(())
 }
@@ -187,11 +204,13 @@ fn update_word_count(
 pub fn calculate_scores(
     mut db: KVDatabase<String, Vec<TempTermIndex>>,
     db_path: PathBuf,
+    seek_path: PathBuf,
     num_docs: u64,
 ) -> Result<()> {
     let temp_db_path = format!("{}{}", db_path.display(), TEMP_FILE_SUFFIX);
+    let temp_seek_path = format!("{}{}", seek_path.display(), TEMP_FILE_SUFFIX);
 
-    let mut temp_db = KVDatabase::new(temp_db_path.clone().into())?;
+    let mut temp_db = KVDatabase::new(temp_db_path.clone().into(), temp_seek_path.clone().into())?;
 
     let mut final_map: HashMap<String, Vec<TermIndex>> = HashMap::new();
 
@@ -215,19 +234,17 @@ pub fn calculate_scores(
 
         final_map.insert(key, new_data);
 
-        if i % 1_000 == 0 {
-            println!("Translate {i} words to tf-idf scores");
-        }
-
         if i % MAX_ITERATIONS as usize == 0 {
             temp_db.extend(final_map)?;
             final_map = HashMap::new();
+            println!("Translate {i} words to tf-idf scores");
         }
     }
 
     temp_db.extend(final_map)?;
 
     rename(temp_db_path, db_path)?;
+    rename(temp_seek_path, seek_path)?;
 
     Ok(())
 }
