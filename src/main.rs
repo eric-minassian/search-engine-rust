@@ -2,7 +2,7 @@ use clap::{Parser, ValueHint};
 use search_engine::{
     error::{Error, Result},
     inverted_index::disk_inverted_index::DiskInvertedIndex,
-    search_engine::SearchEngine,
+    search::engine::SearchEngine,
 };
 use std::{io, path::PathBuf};
 

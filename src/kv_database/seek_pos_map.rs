@@ -1,11 +1,16 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, hash::Hash};
+use std::collections::HashMap;
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct SeekPosMap<K>
-where
-    K: Hash + Eq,
-{
-    pub map: HashMap<K, u64>,
+pub struct SeekPos {
     pub pos: u64,
+    pub len: u64,
 }
+
+impl SeekPos {
+    pub const fn new(pos: u64, len: u64) -> Self {
+        Self { pos, len }
+    }
+}
+
+pub type SeekPosMap<K> = HashMap<K, SeekPos>;

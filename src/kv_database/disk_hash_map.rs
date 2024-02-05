@@ -1,22 +1,20 @@
-use rev_buf_reader::RevBufReader;
 use serde::{Deserialize, Serialize};
-use serde_json::to_string;
+
+use std::io::Read;
 use std::{
     collections::HashMap,
     fmt::Display,
     fs::{remove_file, rename, File},
     hash::Hash,
-    io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
+    io::{BufReader, BufWriter, Seek, SeekFrom, Write},
     marker::PhantomData,
     path::PathBuf,
 };
 
 use crate::error::{Error, Result};
 
-use super::{
-    constants::{KEY_DELIMITER, TEMP_FILE_SUFFIX},
-    seek_pos_map::SeekPosMap,
-};
+use super::seek_pos_map::SeekPos;
+use super::{constants::TEMP_FILE_SUFFIX, seek_pos_map::SeekPosMap};
 
 #[derive(Debug)]
 pub struct KVDatabase<K, V>
@@ -25,59 +23,63 @@ where
     V: Serialize + for<'de> Deserialize<'de> + Clone,
 {
     db_path: PathBuf,
-    seek_pos_map: SeekPosMap<K>,
-    database: BufReader<File>,
-    iter_seek_pos: u64,
+    seek_path: PathBuf,
+    pub seek_pos_map: SeekPosMap<K>,
+    pub database: BufReader<File>,
     _marker: PhantomData<V>,
 }
 
-impl<K, V> Iterator for KVDatabase<K, V>
-where
-    K: Serialize + for<'de> Deserialize<'de> + Eq + Hash + Display + Clone + From<String>,
-    V: Serialize + for<'de> Deserialize<'de> + Clone,
-{
-    type Item = (K, V);
+// impl<K, V> IntoIterator for KVDatabase<K, V>
+// where
+//     K: Serialize + for<'de> Deserialize<'de> + Eq + Hash + Display + Clone + From<String>,
+//     V: Serialize + for<'de> Deserialize<'de> + Clone,
+// {
+// type Item = (K, V);
+// type Item = (K, V);
+// type IntoIter = KVDatabaseIterator<K, V>;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.iter_seek_pos >= self.seek_pos_map.pos {
-            return None;
-        }
+// fn next(&mut self) -> Option<Self::Item> {
+//     let (key, seek_pos) = self.seek_pos_map.next()?;
 
-        self.database
-            .seek(SeekFrom::Start(self.iter_seek_pos))
-            .expect("Failed to seek to next position");
+// if self.iter_seek_pos >= self.seek_pos_map.pos {
+//     return None;
+// }
 
-        let mut buffer = String::new();
-        self.database
-            .read_line(&mut buffer)
-            .expect("Failed to read line from database");
+// self.database
+//     .seek(SeekFrom::Start(self.iter_seek_pos))
+//     .expect("Failed to seek to next position");
 
-        let (key, value) = match buffer.split_once(KEY_DELIMITER) {
-            Some((key_len, rest)) => {
-                let key_len = key_len
-                    .parse::<usize>()
-                    .expect("Failed to parse key length");
-                let key = K::from(rest[..key_len].to_string());
-                let value = &rest[key_len..];
+// let mut buffer = String::new();
+// self.database
+//     .read_line(&mut buffer)
+//     .expect("Failed to read line from database");
 
-                (key, value)
-            }
-            None => {
-                panic!("KEY_DELIMITER not found");
-            }
-        };
+// let (key, value) = match buffer.split_once(KEY_DELIMITER) {
+//     Some((key_len, rest)) => {
+//         let key_len = key_len
+//             .parse::<usize>()
+//             .expect("Failed to parse key length");
+//         let key = K::from(rest[..key_len].to_string());
+//         let value = &rest[key_len..];
 
-        self.iter_seek_pos = self
-            .database
-            .stream_position()
-            .expect("Failed to get stream position");
+//         (key, value)
+//     }
+//     None => {
+//         panic!("KEY_DELIMITER not found");
+//     }
+// };
 
-        Some((
-            key,
-            serde_json::from_str(value).expect("Failed to deserialize value"),
-        ))
-    }
-}
+// self.iter_seek_pos = self
+//     .database
+//     .stream_position()
+//     .expect("Failed to get stream position");
+
+// Some((
+//     key,
+//     serde_json::from_str(value).expect("Failed to deserialize value"),
+// ))
+// }
+// }
 
 impl<K, V> KVDatabase<K, V>
 where
@@ -85,59 +87,53 @@ where
     V: Serialize + for<'de> Deserialize<'de> + Clone,
 {
     pub fn new(db_path: PathBuf) -> Result<Self> {
-        let db_file = File::create(&db_path)?;
-        let mut writer = BufWriter::new(db_file);
-        let empty_map: HashMap<K, V> = HashMap::new();
-        serde_json::to_writer(&mut writer, &empty_map)
-            .map_err(|e| Error::Generic(e.to_string()))?;
+        let seek_path = db_path.with_extension("seek");
+
+        let seek_pos_map: SeekPosMap<K> = SeekPosMap::new();
+
+        let serialized =
+            bincode::serialize(&seek_pos_map).map_err(|e| Error::Generic(e.to_string()))?;
+        let mut file = File::create(&seek_path)?;
+        file.write_all(&serialized)?;
 
         Ok(Self {
-            seek_pos_map: SeekPosMap {
-                map: HashMap::new(),
-                pos: 0,
-            },
             database: BufReader::new(File::create(&db_path)?),
             db_path,
-            iter_seek_pos: 0,
+            seek_path,
+            seek_pos_map,
             _marker: PhantomData,
         })
     }
 
-    pub fn from_path(db_path: PathBuf) -> Result<Self> {
-        let mut database = RevBufReader::new(File::open(&db_path)?);
-        let mut buffer = String::new();
-        database.read_line(&mut buffer)?;
+    pub fn from(db_path: PathBuf) -> Result<Self> {
+        let seek_path = db_path.with_extension("seek");
+
+        let mut file = File::open(&seek_path)?;
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer)?;
         let seek_pos_map: SeekPosMap<K> =
-            serde_json::from_str(&buffer).map_err(|e| Error::Generic(e.to_string()))?;
+            bincode::deserialize(&buffer).map_err(|e| Error::Generic(e.to_string()))?;
 
         Ok(Self {
             database: BufReader::new(File::open(&db_path)?),
-            seek_pos_map,
             db_path,
-            iter_seek_pos: 0,
+            seek_path,
+            seek_pos_map,
             _marker: PhantomData,
         })
     }
 
     pub fn get(&mut self, key: &K) -> Result<Option<V>> {
-        if let Some(seek_pos) = self.seek_pos_map.map.get(key) {
-            let key_len = key.to_string().len();
+        if let Some(seek_pos) = self.seek_pos_map.get(key) {
+            self.database.seek(SeekFrom::Start(seek_pos.pos))?;
 
-            self.database.seek(SeekFrom::Start(*seek_pos))?;
+            // Read seek_pos.len bytes
+            let mut buffer = vec![0; seek_pos.len as usize];
+            self.database.read_exact(&mut buffer)?;
+            let value: V =
+                bincode::deserialize(&buffer).map_err(|e| Error::Generic(e.to_string()))?;
 
-            let mut data = String::new();
-            self.database.read_line(&mut data)?;
-            let value_str = match data.split_once(KEY_DELIMITER) {
-                Some((_, value)) => &value[key_len..],
-                None => {
-                    return Err(Error::Generic("KEY_DELIMITER not found".to_string()));
-                }
-            }
-            .trim();
-
-            Ok(Some(
-                serde_json::from_str(value_str).map_err(|e| Error::Generic(e.to_string()))?,
-            ))
+            Ok(Some(value))
         } else {
             Ok(None)
         }
@@ -151,45 +147,39 @@ where
         let temp_db_path = self.db_path.with_extension(TEMP_FILE_SUFFIX);
         let mut temp_db_writer = BufWriter::new(File::create(&temp_db_path)?);
 
-        let mut new_seek_pos_map = SeekPosMap {
-            map: HashMap::new(),
-            pos: 0,
-        };
+        let mut new_seek_pos_map: HashMap<K, SeekPos> = SeekPosMap::new();
 
-        for (key, &offset) in &self.seek_pos_map.map {
-            if !hashmap.contains_key(key) {
-                self.database.seek(SeekFrom::Start(offset))?;
-                let mut line = String::new();
-                self.database.read_line(&mut line)?;
-                new_seek_pos_map
-                    .map
-                    .insert(key.clone(), temp_db_writer.stream_position()?);
-                write!(temp_db_writer, "{line}")?;
+        for (key, seek_pos) in &self.seek_pos_map {
+            if !hashmap.contains_key(&key) {
+                self.database.seek(SeekFrom::Start(seek_pos.pos))?;
+                let mut buffer = vec![0; seek_pos.len as usize];
+                self.database.read_exact(&mut buffer)?;
+                new_seek_pos_map.insert(
+                    key.clone(),
+                    SeekPos::new(temp_db_writer.stream_position()?, seek_pos.len),
+                );
+
+                temp_db_writer.write_all(&buffer)?;
             }
         }
 
         for (key, value) in hashmap {
-            let key_len = key.to_string().len();
+            let value = bincode::serialize(&value).map_err(|e| Error::Generic(e.to_string()))?;
+            new_seek_pos_map.insert(
+                key,
+                SeekPos::new(temp_db_writer.stream_position()?, value.len() as u64),
+            );
 
-            let new_value_str = to_string(&value).map_err(|e| Error::Generic(e.to_string()))?;
-
-            let stream_pos = temp_db_writer.stream_position()?;
-
-            writeln!(
-                temp_db_writer,
-                "{}{}{}{}",
-                key_len, KEY_DELIMITER, &key, new_value_str
-            )?;
-
-            new_seek_pos_map.map.insert(key, stream_pos);
+            temp_db_writer.write_all(&value)?;
         }
 
-        // Write the new seek_pos_map to the end of the file
-        new_seek_pos_map.pos = temp_db_writer.stream_position()?;
-        serde_json::to_writer(&mut temp_db_writer, &new_seek_pos_map)
-            .map_err(|e| Error::Generic(e.to_string()))?;
-
         temp_db_writer.flush()?;
+
+        // Write the new seek_pos_map to the self.seek_path
+        let serialized =
+            bincode::serialize(&new_seek_pos_map).map_err(|e| Error::Generic(e.to_string()))?;
+        let mut file = File::create(&self.seek_path)?;
+        file.write_all(&serialized)?;
 
         remove_file(&self.db_path)?;
         rename(temp_db_path, &self.db_path)?;
@@ -214,39 +204,29 @@ where
         let temp_db_path = self.db_path.with_extension(TEMP_FILE_SUFFIX);
         let mut temp_db_writer = BufWriter::new(File::create(&temp_db_path)?);
 
-        let mut new_seek_pos_map = SeekPosMap {
-            map: HashMap::new(),
-            pos: 0,
-        };
+        let mut new_seek_pos_map: HashMap<K, SeekPos> = SeekPosMap::new();
 
-        for (key, &offset) in &self.seek_pos_map.map {
-            if !hashmap.contains_key(key) {
-                self.database.seek(SeekFrom::Start(offset))?;
-                let mut line = String::new();
-                self.database.read_line(&mut line)?;
+        for (key, seek_pos) in &self.seek_pos_map {
+            if !hashmap.contains_key(&key) {
+                self.database.seek(SeekFrom::Start(seek_pos.pos))?;
+                let mut buffer = vec![0; seek_pos.len as usize];
+                self.database.read_exact(&mut buffer)?;
+                new_seek_pos_map.insert(
+                    key.clone(),
+                    SeekPos::new(temp_db_writer.stream_position()?, seek_pos.len),
+                );
 
-                new_seek_pos_map
-                    .map
-                    .insert(key.clone(), temp_db_writer.stream_position()?);
-                write!(temp_db_writer, "{line}")?;
+                temp_db_writer.write_all(&buffer)?;
             }
         }
 
         for (key, value) in hashmap {
-            let key_len = key.to_string().len();
-
-            let new_value = if let Some(&offset) = self.seek_pos_map.map.get(&key) {
-                self.database.seek(SeekFrom::Start(offset))?;
-                let mut old_value_str = String::new();
-                self.database.read_line(&mut old_value_str)?;
-                let mut old_value = serde_json::from_str::<V>(
-                    old_value_str
-                        .split_once(KEY_DELIMITER)
-                        .ok_or_else(|| Error::Generic("KEY_DELIMITER not found".to_string()))?
-                        .1[key_len..]
-                        .trim(),
-                )
-                .map_err(|e| Error::Generic(e.to_string()))?;
+            let new_value = if let Some(seek_pos) = self.seek_pos_map.get(&key) {
+                self.database.seek(SeekFrom::Start(seek_pos.pos))?;
+                let mut buffer = vec![0; seek_pos.len as usize];
+                self.database.read_exact(&mut buffer)?;
+                let mut old_value: V =
+                    bincode::deserialize(&buffer).map_err(|e| Error::Generic(e.to_string()))?;
                 old_value.extend(value);
 
                 old_value
@@ -254,25 +234,23 @@ where
                 value
             };
 
-            let new_value_str = to_string(&new_value).map_err(|e| Error::Generic(e.to_string()))?;
+            let value =
+                bincode::serialize(&new_value).map_err(|e| Error::Generic(e.to_string()))?;
+            new_seek_pos_map.insert(
+                key,
+                SeekPos::new(temp_db_writer.stream_position()?, value.len() as u64),
+            );
 
-            let stream_pos = temp_db_writer.stream_position()?;
-
-            writeln!(
-                temp_db_writer,
-                "{}{}{}{}",
-                key_len, KEY_DELIMITER, &key, new_value_str
-            )?;
-
-            new_seek_pos_map.map.insert(key, stream_pos);
+            temp_db_writer.write_all(&value)?;
         }
 
-        // Write the new seek_pos_map to the end of the file
-        new_seek_pos_map.pos = temp_db_writer.stream_position()?;
-        serde_json::to_writer(&mut temp_db_writer, &new_seek_pos_map)
-            .map_err(|e| Error::Generic(e.to_string()))?;
-
         temp_db_writer.flush()?;
+
+        // Write the new seek_pos_map to the self.seek_path
+        let serialized =
+            bincode::serialize(&new_seek_pos_map).map_err(|e| Error::Generic(e.to_string()))?;
+        let mut file = File::create(&self.seek_path)?;
+        file.write_all(&serialized)?;
 
         remove_file(&self.db_path)?;
         rename(temp_db_path, &self.db_path)?;
@@ -369,8 +347,8 @@ mod tests {
         db.extend(hashmap.clone())
             .expect("Failed to insert hashmap");
 
-        let mut db2 = KVDatabase::from_path(db_path.clone())
-            .expect("Failed to restore DiskHashMap from path");
+        let mut db2 =
+            KVDatabase::from(db_path.clone()).expect("Failed to restore DiskHashMap from path");
 
         assert_eq!(
             db2.get(&"hello".to_string()).expect("Failed to get value"),
@@ -430,14 +408,20 @@ mod tests {
 
         let mut iter = db.into_iter();
 
-        let first_value = iter.next().expect("Failed to get next value");
+        let first_value = iter
+            .next()
+            .expect("Failed to get next value")
+            .expect("Failed to get value from disk");
 
         assert!(
             first_value == ("hello".to_string(), vec![1, 2, 3])
                 || first_value == ("world".to_string(), vec![4, 5, 6])
         );
 
-        let second_value = iter.next().expect("Failed to get next value");
+        let second_value = iter
+            .next()
+            .expect("Failed to get next value")
+            .expect("Failed to get value from disk");
         let expected = if first_value.0 == "hello" {
             ("world".to_string(), vec![4, 5, 6])
         } else {
@@ -483,6 +467,47 @@ mod tests {
         assert_eq!(
             db.get(&"hello".to_string()).expect("Failed to get value"),
             Some(vec![10, 11, 12])
+        );
+        assert_eq!(
+            db.get(&"world".to_string()).expect("Failed to get value"),
+            Some(vec![4, 5, 6])
+        );
+    }
+
+    #[test]
+    fn insert_struct() {
+        #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+        struct TestStruct {
+            a: u64,
+            b: Vec<String>,
+        }
+
+        let db_path = PathBuf::from("tests/insert_struct.db");
+
+        let mut db = KVDatabase::new(db_path.clone()).expect("Failed to create DiskHashMap");
+
+        let mut hashmap = HashMap::new();
+        hashmap.insert("hello".to_string(), TestStruct { a: 1, b: vec![] });
+        hashmap.insert(
+            "world".to_string(),
+            TestStruct {
+                a: 2,
+                b: vec!["a".to_string(), "b".to_string()],
+            },
+        );
+
+        db.insert(hashmap).expect("Failed to insert hashmap");
+
+        assert_eq!(
+            db.get(&"hello".to_string()).expect("Failed to get value"),
+            Some(TestStruct { a: 1, b: vec![] })
+        );
+        assert_eq!(
+            db.get(&"world".to_string()).expect("Failed to get value"),
+            Some(TestStruct {
+                a: 2,
+                b: vec!["a".to_string(), "b".to_string()]
+            })
         );
     }
 }

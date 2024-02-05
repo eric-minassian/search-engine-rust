@@ -19,3 +19,4 @@ data
 # Output
 *.json
 *.db
+*.seek

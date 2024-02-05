@@ -1,13 +1,12 @@
+use super::{
+    constants::{BOLD_WEIGHT, HEADER_WEIGHT, MAX_ITERATIONS, TITLE_WEIGHT},
+    doc_map::{Doc, DocID, DocMap, TF, TFIDF},
+};
 use crate::{
     error::{Error, Result},
     kv_database::{constants::TEMP_FILE_SUFFIX, disk_hash_map::KVDatabase},
+    tokenizer::Tokenizer,
 };
-
-use super::{
-    constants::{BOLD_WEIGHT, HEADER_WEIGHT, TITLE_WEIGHT},
-    doc_map::{Doc, DocID, DocMap, TF, TFIDF},
-};
-use rust_stemmers::{Algorithm, Stemmer};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -16,7 +15,6 @@ use std::{
     io::BufReader,
     path::PathBuf,
 };
-use tokenizers::Tokenizer;
 use walkdir::WalkDir;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -53,15 +51,15 @@ impl DiskInvertedIndex {
     ) -> Result<Self> {
         create_index(db_path.clone(), url_map_path.clone(), crawled_data_path)?;
 
-        let db = KVDatabase::from_path(db_path)?;
-        let url_map = KVDatabase::from_path(url_map_path)?;
+        let db = KVDatabase::from(db_path)?;
+        let url_map = KVDatabase::from(url_map_path)?;
 
         Ok(Self { db, url_map })
     }
 
     pub fn from_path(db_path: PathBuf, url_map_path: PathBuf) -> Result<Self> {
-        let db = KVDatabase::from_path(db_path)?;
-        let url_map = KVDatabase::from_path(url_map_path)?;
+        let db = KVDatabase::from(db_path)?;
+        let url_map = KVDatabase::from(url_map_path)?;
 
         Ok(Self { db, url_map })
     }
@@ -77,9 +75,7 @@ impl DiskInvertedIndex {
 
 #[allow(clippy::too_many_lines)]
 fn create_index(db_path: PathBuf, url_map_path: PathBuf, data_path: PathBuf) -> Result<()> {
-    let stemmer = Stemmer::create(Algorithm::English);
-    let tokenizer = Tokenizer::from_pretrained("bert-base-cased", None)
-        .map_err(|e| Error::Generic(format!("Failed to load tokenizer: {e}")))?;
+    let tokenizer = Tokenizer::new()?;
 
     let mut db = KVDatabase::new(db_path.clone())?;
     let mut url_map = KVDatabase::new(url_map_path)?;
@@ -102,82 +98,32 @@ fn create_index(db_path: PathBuf, url_map_path: PathBuf, data_path: PathBuf) -> 
         let doc_id = doc_id as DocID;
 
         // Extract and filter all text
-        let all_text = document.root_element().text().collect::<Vec<_>>().join(" ");
-
         let mut word_count: HashMap<String, u32> = HashMap::new();
 
-        tokenizer
-            .encode(all_text, false)
-            .map_err(|e| Error::Generic(format!("Failed to tokenize text: {e}")))?
-            .get_tokens()
-            .iter()
-            .for_each(|token| {
-                let count = word_count.entry(token.clone()).or_insert(0);
-                *count += 1;
-            });
+        let all_text = document.root_element().text().collect::<Vec<_>>();
+        let bolded_words = select_text(&document, "b, strong").unwrap_or_default();
+        let title_words = select_text(&document, "title").unwrap_or_default();
+        let header_words = select_text(&document, "h1, h2, h3, h4, h5").unwrap_or_default();
 
-        let bolded_words = document
-            .select(
-                &Selector::parse("b, strong")
-                    .map_err(|e| Error::Generic(format!("Failed to parse selector: {e}")))?,
-            )
-            .map(|element| element.text().collect::<Vec<_>>().join(" "))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let title_words = document
-            .select(
-                &Selector::parse("title")
-                    .map_err(|e| Error::Generic(format!("Failed to parse selector: {e}")))?,
-            )
-            .map(|element| element.text().collect::<Vec<_>>().join(" "))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let header_words = document
-            .select(
-                &Selector::parse("h1, h2, h3, h4, h5")
-                    .map_err(|e| Error::Generic(format!("Failed to parse selector: {e}")))?,
-            )
-            .map(|element| element.text().collect::<Vec<_>>().join(" "))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let bolded_words = bolded_words
-            .split_whitespace()
-            .map(str::trim)
-            .map(|token| stemmer.stem(token))
-            .map(String::from)
-            .collect::<Vec<_>>();
-
-        let title_words = title_words
-            .split_whitespace()
-            .map(str::trim)
-            .map(|token| stemmer.stem(token))
-            .map(String::from)
-            .collect::<Vec<_>>();
-
-        let header_words = header_words
-            .split_whitespace()
-            .map(str::trim)
-            .map(|token| stemmer.stem(token))
-            .map(String::from)
-            .collect::<Vec<_>>();
-
-        for word in bolded_words {
-            let count = word_count.entry(word).or_insert(0);
-            *count += (BOLD_WEIGHT - 1.0) as TF;
-        }
-
-        for word in title_words {
-            let count = word_count.entry(word).or_insert(0);
-            *count += (TITLE_WEIGHT - 1.0) as TF;
-        }
-
-        for word in header_words {
-            let count = word_count.entry(word).or_insert(0);
-            *count += (HEADER_WEIGHT - 1.0) as TF;
-        }
+        update_word_count(all_text, &tokenizer, &mut word_count, 1);
+        update_word_count(
+            title_words,
+            &tokenizer,
+            &mut word_count,
+            TITLE_WEIGHT as u32,
+        );
+        update_word_count(
+            bolded_words,
+            &tokenizer,
+            &mut word_count,
+            BOLD_WEIGHT as u32,
+        );
+        update_word_count(
+            header_words,
+            &tokenizer,
+            &mut word_count,
+            HEADER_WEIGHT as u32,
+        );
 
         for (word, count) in word_count {
             let index_data = TempTermIndex { doc_id, tf: count };
@@ -191,7 +137,7 @@ fn create_index(db_path: PathBuf, url_map_path: PathBuf, data_path: PathBuf) -> 
             println!("Processed {doc_id} documents");
         }
 
-        if doc_id % 10_000 == 0 {
+        if doc_id % MAX_ITERATIONS == 0 {
             db.extend(inverted_index)?;
             url_map.insert(doc_map)?;
 
@@ -210,8 +156,36 @@ fn create_index(db_path: PathBuf, url_map_path: PathBuf, data_path: PathBuf) -> 
     Ok(())
 }
 
+fn select_text<'a>(document: &'a Html, selector: &str) -> Result<Vec<&'a str>> {
+    Ok(document
+        .select(
+            &Selector::parse(selector)
+                .map_err(|e| Error::Generic(format!("Failed to parse selector: {e}")))?,
+        )
+        .map(|element| element.text().collect::<Vec<_>>())
+        .collect::<Vec<_>>()
+        .concat())
+}
+
+fn update_word_count(
+    title_words: Vec<&str>,
+    tokenizer: &Tokenizer,
+    word_count: &mut HashMap<String, u32>,
+    weight: u32,
+) {
+    title_words
+        .iter()
+        .map(|text| tokenizer.tokenize(text))
+        .for_each(|tokens| {
+            tokens.into_iter().for_each(|token| {
+                let count = word_count.entry(token).or_insert(0);
+                *count += weight;
+            });
+        });
+}
+
 pub fn calculate_scores(
-    db: KVDatabase<String, Vec<TempTermIndex>>,
+    mut db: KVDatabase<String, Vec<TempTermIndex>>,
     db_path: PathBuf,
     num_docs: u64,
 ) -> Result<()> {
@@ -221,7 +195,9 @@ pub fn calculate_scores(
 
     let mut final_map: HashMap<String, Vec<TermIndex>> = HashMap::new();
 
-    for (i, (key, value)) in db.enumerate() {
+    for (i, data) in db.into_iter().enumerate() {
+        let (key, value) = data?;
+
         let data_len = value.len();
 
         let new_data = value
@@ -240,10 +216,10 @@ pub fn calculate_scores(
         final_map.insert(key, new_data);
 
         if i % 1_000 == 0 {
-            println!("Translate {i} documents");
+            println!("Translate {i} words to tf-idf scores");
         }
 
-        if i % 10_000 == 0 {
+        if i % MAX_ITERATIONS as usize == 0 {
             temp_db.extend(final_map)?;
             final_map = HashMap::new();
         }

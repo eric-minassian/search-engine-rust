@@ -1,9 +1,11 @@
 use crate::{
     error::{Error, Result},
-    inverted_index::{disk_inverted_index::DiskInvertedIndex, doc_map::Doc},
+    inverted_index::disk_inverted_index::DiskInvertedIndex,
     tokenizer::Tokenizer,
 };
 use std::collections::HashMap;
+
+use super::search_result::SearchResult;
 
 pub struct SearchEngine {
     inverted_index_db: DiskInvertedIndex,
@@ -18,7 +20,7 @@ impl SearchEngine {
         })
     }
 
-    pub fn search(&mut self, query: &str) -> Result<Vec<Doc>> {
+    pub fn search(&mut self, query: &str) -> Result<Vec<SearchResult>> {
         let mut document_ids: HashMap<u64, f64> = HashMap::new();
 
         let stemmed_tokens = self.tokenizer.tokenize(query);
@@ -35,20 +37,18 @@ impl SearchEngine {
         }
 
         let mut document_ids: Vec<_> = document_ids.into_iter().collect();
-        document_ids.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Greater) // Treat None (i.e., when comparing with NaN) as if 'a' is greater, to sort NaN to the end
-        });
+        document_ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Greater));
 
         document_ids
-            .iter()
+            .into_iter()
             .map(|(doc_id, score)| {
                 self.inverted_index_db
-                    .get_doc(*doc_id)
+                    .get_doc(doc_id)
                     .map_err(|e| Error::Generic(format!("Failed to get document: {e}")))
                     .and_then(|doc_opt| {
                         doc_opt.ok_or_else(|| Error::Generic("Document not found".to_string()))
                     })
-                    .map(|doc| Doc::new(doc.url))
+                    .map(|doc| SearchResult::new(doc.url, score))
             })
             .collect()
     }
